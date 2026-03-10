@@ -5,7 +5,7 @@ SMG (澳門氣象局) 每月消息自動下載並整合成PDF
 
 from playwright.sync_api import sync_playwright
 from datetime import datetime, date
-from dateutil.relativedelta import relativedelta
+import calendar
 from pypdf import PdfWriter, PdfReader
 import os
 import re
@@ -61,8 +61,10 @@ BASE_URL = "https://www.smg.gov.mo"
 def get_target_month() -> tuple[int, int]:
     """返回目標年份和月份（執行月份的上一個月）"""
     today = date.today()
-    target = today - relativedelta(months=1)
-    return target.year, target.month
+    if today.month == 1:
+        return today.year - 1, 12
+    else:
+        return today.year, today.month - 1
 
 # ── 日期匹配 ──────────────────────────────────────────────────────────────────
 MONTH_ZH = {
