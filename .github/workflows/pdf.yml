@@ -27,9 +27,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          pip install playwright pypdf
+          sudo apt-get update -q
+          sudo apt-get install -y -q ghostscript
+
+      - name: Install Python dependencies
+        run: pip install playwright pypdf
 
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
