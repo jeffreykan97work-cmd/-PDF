@@ -1,33 +1,68 @@
-name: Generate SMG News PDF
+name: SMG Monthly PDF Report
 
-# 設定幾時執行
 on:
+  # 每月1號早上9點自動執行（UTC+8 即01:00 UTC）
   schedule:
-    - cron: '0 8 1 * *' # 每個月1號早上8點 (UTC時間，大概係澳門時間下晝4點)自動執行
-  workflow_dispatch: # 呢個設定容許你隨時手動撳掣執行
+    - cron: '0 1 1 * *'
+  # 亦可手動觸發（支援指定年月）
+  workflow_dispatch:
+    inputs:
+      year:
+        description: '年份（留空=自動上個月）'
+        required: false
+        default: ''
+      month:
+        description: '月份（留空=自動上個月）'
+        required: false
+        default: ''
 
 jobs:
-  build:
+  generate-report:
     runs-on: ubuntu-latest
+
     steps:
-      - name: 攞出代碼
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: 安裝 Python 環境
-        uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
-      - name: 安裝 Playwright 同相關套件
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Run scraper
         run: |
-          pip install playwright
-          playwright install chromium
+          YEAR="${{ github.event.inputs.year }}"
+          MONTH="${{ github.event.inputs.month }}"
+          ARGS=""
+          [ -n "$YEAR"  ] && ARGS="$ARGS --year $YEAR"
+          [ -n "$MONTH" ] && ARGS="$ARGS --month $MONTH"
+          python scraper.py $ARGS
 
-      - name: 執行自動化腳本
-        run: python scraper.py
-
-      - name: 將生成嘅 PDF 變成可以下載嘅檔案
+      - name: Upload PDF report as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SMG_Monthly_PDF
-          path: "*.pdf"
+          name: SMG-Monthly-Report
+          path: SMG_Monthly_Report_*.pdf
+          retention-days: 90
+
+      - name: Upload individual PDFs (tmp folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMG-Individual-PDFs
+          path: smg_tmp_*/
+          retention-days: 30
+          if-no-files-found: warn
