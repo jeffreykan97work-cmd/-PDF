@@ -1,10 +1,8 @@
 name: SMG Monthly PDF Report
 
 on:
-  # 每月1號早上9點自動執行（UTC+8 即01:00 UTC）
   schedule:
     - cron: '0 1 1 * *'
-  # 亦可手動觸發（支援指定年月）
   workflow_dispatch:
     inputs:
       year:
@@ -29,16 +27,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install playwright pypdf
 
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
@@ -52,14 +43,15 @@ jobs:
           [ -n "$MONTH" ] && ARGS="$ARGS --month $MONTH"
           python scraper.py $ARGS
 
-      - name: Upload PDF report as artifact
+      - name: Upload PDF report
         uses: actions/upload-artifact@v4
         with:
           name: SMG-Monthly-Report
           path: SMG_Monthly_Report_*.pdf
           retention-days: 90
+          if-no-files-found: warn
 
-      - name: Upload individual PDFs (tmp folder)
+      - name: Upload individual PDFs
         uses: actions/upload-artifact@v4
         with:
           name: SMG-Individual-PDFs
