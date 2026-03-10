@@ -1,0 +1,33 @@
+name: Generate SMG News PDF
+
+# 設定幾時執行
+on:
+  schedule:
+    - cron: '0 8 1 * *' # 每個月1號早上8點 (UTC時間，大概係澳門時間下晝4點)自動執行
+  workflow_dispatch: # 呢個設定容許你隨時手動撳掣執行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 攞出代碼
+        uses: actions/checkout@v3
+
+      - name: 安裝 Python 環境
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: 安裝 Playwright 同相關套件
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: 執行自動化腳本
+        run: python scraper.py
+
+      - name: 將生成嘅 PDF 變成可以下載嘅檔案
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMG_Monthly_PDF
+          path: "*.pdf"
