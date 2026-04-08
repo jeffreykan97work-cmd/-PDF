@@ -11,9 +11,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── 配置 ──────────────────────────────────────────────────────────────────
+# 將所有目標頁面（含原先的 fallback 頁面）全部獨立列出，確保絕對會爬取
 SOURCES = [
-    {"name": "news", "url": "https://www.smg.gov.mo/zh/subpage/73"},
-    {"name": "climate", "url": "https://www.smg.gov.mo/zh/subpage/124"},
+    # 新聞與活動相關
+    {"name": "subpage_73", "url": "https://www.smg.gov.mo/zh/subpage/73"},
+    {"name": "news", "url": "https://www.smg.gov.mo/zh/news"},
+    {"name": "activity", "url": "https://www.smg.gov.mo/zh/activity"},
+    
+    # 氣候與節氣相關
+    {"name": "subpage_124", "url": "https://www.smg.gov.mo/zh/subpage/124"},
+    {"name": "climate", "url": "https://www.smg.gov.mo/zh/climate"},
+    {"name": "seasonal", "url": "https://www.smg.gov.mo/zh/seasonal"},
+    
+    # 其他指定頁面
     {"name": "holiday_weather", "url": "https://www.smg.gov.mo/zh/news/Holiday_weather"},
     {"name": "chat_info", "url": "https://www.smg.gov.mo/zh/chat-info"},
 ]
@@ -96,7 +106,7 @@ def collect_items_from_source(page, source, target_y, target_m):
     
     for p_num in range(1, MAX_PAGES + 1):
         url = build_page_url(source['url'], p_num)
-        log.info(f"  正在掃描: {url}")
+        log.info(f"  正在掃描 [{source['name']}]: {url}")
         
         try:
             page.goto(url, wait_until="networkidle", timeout=30000)
@@ -203,13 +213,22 @@ def main(year=None, month=None):
         for src in SOURCES:
             all_items.extend(collect_items_from_source(page, src, year, month))
         
-        # 2. 去重與排序 (日期升序)
-        all_items.sort(key=lambda x: x['date_str'])
+        # 2. 去重與排序 (確保同 URL 不會被重複處理)
+        unique_urls = set()
+        deduplicated_items = []
+        for item in all_items:
+            if item['url'] not in unique_urls:
+                unique_urls.add(item['url'])
+                deduplicated_items.append(item)
+                
+        deduplicated_items.sort(key=lambda x: x['date_str'])
+        
+        log.info(f"📊 共收集到 {len(deduplicated_items)} 篇不重複文章")
         
         # 3. 下載
         final_pdf_list = []
-        for i, item in enumerate(all_items):
-            log.info(f"({i+1}/{len(all_items)}) 處理: {item['date_str']} {item['text'][:20]}...")
+        for i, item in enumerate(deduplicated_items):
+            log.info(f"({i+1}/{len(deduplicated_items)}) 處理: {item['date_str']} {item['text'][:20]}...")
             pdfs = download_pdf_versions(page, item, tmp_dir, i)
             final_pdf_list.extend(pdfs)
             
