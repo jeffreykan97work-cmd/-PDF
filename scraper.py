@@ -47,9 +47,7 @@ PRINT_CSS = """
 
 def get_target_month():
     today = date.today()
-    first = today.replace(day=1)
-    last_month = first - (today - first.replace(day=1)) # 簡單邏輯：上個月
-    # 正確邏輯：
+    # 正確邏輯：上個月
     y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
     return y, m
 
@@ -190,7 +188,9 @@ def main(year=None, month=None):
         year, month = get_target_month()
         
     log.info(f"🚀 開始抓取 SMG 報告: {year}-{month:02d}")
-    tmp_dir = f"smg_cache_{year}_{month}"
+    
+    # 確保資料夾命名符合 GitHub Actions 的尋找路徑
+    tmp_dir = f"smg_tmp_{year}_{month:02d}"
     os.makedirs(tmp_dir, exist_ok=True)
     
     with sync_playwright() as p:
@@ -228,7 +228,8 @@ def main(year=None, month=None):
     with open(raw_merged, "wb") as f:
         writer.write(f)
         
-    output_filename = f"SMG_Report_{year}_{month:02d}.pdf"
+    # 確保最終 PDF 命名符合 GitHub Actions 的尋找路徑
+    output_filename = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
     compress_pdf(raw_merged, output_filename)
     log.info(f"✅ 任務完成! 輸出檔案: {output_filename}")
 
