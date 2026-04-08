@@ -5,6 +5,11 @@ SMG (澳門氣象局) 每月消息自動下載並整合成PDF
 - 英/葡文如顯示 "No Related Content" / "Nenhum Conteúdo Relacionado" 則跳過
 - 日期由舊到新排序（升序）
 - 最終PDF壓縮至5MB以下
+
+修復項目：
+- 圖片缺失：改用 networkidle + JS Promise 確保所有圖片載入完畢
+- CSS背景圖缺失：注入 print-color-adjust 強制列印背景
+- 移除固定 wait_for_timeout，改為真實載入狀態判斷
 """
 
 from playwright.sync_api import sync_playwright
@@ -45,6 +50,29 @@ NO_CONTENT_KEYWORDS = [
     "nenhum conteudo relacionado",
 ]
 
+# ── 等待所有圖片載入完成的 JS Promise ─────────────────────────────────────────
+WAIT_IMAGES_JS = """
+    () => new Promise(resolve => {
+        const imgs = [...document.images].filter(i => !i.complete);
+        if (!imgs.length) return resolve();
+        let n = imgs.length;
+        imgs.forEach(i => {
+            i.onload  = () => { if (!--n) resolve(); };
+            i.onerror = () => { if (!--n) resolve(); };
+        });
+        setTimeout(resolve, 5000);
+    })
+"""
+
+# ── 強制列印背景色/背景圖的 CSS ───────────────────────────────────────────────
+PRINT_COLOR_CSS = """
+    *, *::before, *::after {
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+        color-adjust: exact !important;
+    }
+"""
+
 # ── 月份計算 ──────────────────────────────────────────────────────────────────
 def get_target_month():
     today = date.today()
@@ -72,6 +100,26 @@ def is_no_content_page(page) -> bool:
     except Exception:
         return False
 
+# ── 等待頁面圖片完全載入（修復核心）─────────────────────────────────────────
+def wait_for_images(page):
+    """
+    三層等待策略：
+    1. networkidle：等所有網絡請求靜止（含圖片請求）
+    2. JS Promise：確認每個 <img> 的 complete 狀態為 true
+    3. 超時兜底：最多額外等 5 秒，不阻塞流程
+    """
+    # 第一層：networkidle（等所有請求完成）
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception as e:
+        log.debug(f"    networkidle 超時（繼續）：{e}")
+
+    # 第二層：JS 確認所有 <img> 已完成載入
+    try:
+        page.evaluate(WAIT_IMAGES_JS)
+    except Exception as e:
+        log.debug(f"    JS 圖片等待失敗（繼續）：{e}")
+
 # ── 隱藏標題列 ────────────────────────────────────────────────────────────────
 def hide_header(page):
     try:
@@ -85,6 +133,17 @@ def hide_header(page):
         """)
     except Exception:
         pass
+
+# ── 注入列印背景強制CSS ───────────────────────────────────────────────────────
+def inject_print_css(page):
+    """
+    注入 print-color-adjust CSS，確保 CSS background-image 也會被列印。
+    必須在 page.pdf() 之前呼叫。
+    """
+    try:
+        page.add_style_tag(content=PRINT_COLOR_CSS)
+    except Exception as e:
+        log.debug(f"    注入列印CSS失敗（繼續）：{e}")
 
 # ── PDF 合併 ──────────────────────────────────────────────────────────────────
 def merge_pdfs(pdf_files: list, output_path: str) -> bool:
@@ -125,7 +184,8 @@ def compress_pdf(input_path: str, output_path: str) -> bool:
         subprocess.run(["apt-get", "install", "-y", "-q", "ghostscript"],
                        capture_output=True, timeout=120)
 
-    for setting in ["printer", "ebook", "screen"]:
+    # 注意：跳過 /screen（72dpi），避免圖片模糊到近似缺失
+    for setting in ["printer", "ebook"]:
         tmp_out = output_path + f".{setting}.tmp.pdf"
         cmd = [
             "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
@@ -147,10 +207,34 @@ def compress_pdf(input_path: str, output_path: str) -> bool:
         except Exception as e:
             log.warning(f"  gs [{setting}] 失敗：{e}")
 
-    # 最後備用：pypdf 內建壓縮
-    log.warning("  Ghostscript 無法壓到5MB以下，嘗試 pypdf 壓縮...")
+    # 備用：以較低畫質的 /screen 再試一次（最後手段）
+    log.warning("  printer/ebook 無法壓到5MB，嘗試 /screen 設定（圖片品質會降低）...")
+    tmp_screen = output_path + ".screen.tmp.pdf"
+    cmd = [
+        "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/screen",
+        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+        f"-sOutputFile={tmp_screen}", input_path
+    ]
     try:
-        reader = PdfReader(input_path)
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        if result.returncode == 0 and os.path.exists(tmp_screen):
+            compressed_size = os.path.getsize(tmp_screen)
+            log.info(f"  [screen] 壓縮後：{compressed_size/1024/1024:.2f} MB")
+            shutil.move(tmp_screen, output_path)
+            if compressed_size > MAX_BYTES:
+                log.warning(f"⚠️  /screen 後仍有 {compressed_size/1024/1024:.2f} MB，嘗試 pypdf 壓縮...")
+            else:
+                log.info(f"✅ 壓縮成功（screen）：{output_path}")
+                return True
+    except Exception as e:
+        log.warning(f"  gs [screen] 失敗：{e}")
+
+    # 最後備用：pypdf 內建壓縮
+    log.warning("  嘗試 pypdf 壓縮...")
+    try:
+        src = output_path if os.path.exists(output_path) else input_path
+        reader = PdfReader(src)
         writer = PdfWriter()
         for pg in reader.pages:
             pg.compress_content_streams()
@@ -268,6 +352,10 @@ def download_article_all_langs(page, item: dict, tmp_dir: str, idx: int) -> list
     - 中文必定下載
     - 英文/葡文若顯示無相關內容則跳過
     返回成功下載的 PDF 路徑列表（中文在前）
+
+    修復：
+    - 使用 wait_for_images() 取代固定 wait_for_timeout(1800)
+    - 使用 inject_print_css() 確保背景圖列印
     """
     safe     = re.sub(r'[^\w\-]', '_', item["text"])[:35]
     base_key = f"{item['date_str']}_{idx:04d}_{item['source']}_{safe}"
@@ -279,15 +367,24 @@ def download_article_all_langs(page, item: dict, tmp_dir: str, idx: int) -> list
 
         log.info(f"    [{lang_label}] {lang_url}")
         try:
+            # 第一步：導航至頁面，等待 DOM 完成
             page.goto(lang_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1800)
 
-            # 檢查是否「無相關內容」頁面
+            # 第二步：等待所有圖片真正載入完成（修復核心）
+            wait_for_images(page)
+
+            # 第三步：檢查是否「無相關內容」頁面
             if lang_code != "zh" and is_no_content_page(page):
                 log.info(f"    [{lang_label}] ⚠️  無相關內容，跳過")
                 continue
 
+            # 第四步：隱藏標題列
             hide_header(page)
+
+            # 第五步：注入強制列印背景色/背景圖的CSS（修復CSS background-image缺失）
+            inject_print_css(page)
+
+            # 第六步：輸出PDF
             page.pdf(
                 path=pdf_path, format="A4", print_background=True,
                 margin={"top": "10mm", "bottom": "15mm", "left": "15mm", "right": "15mm"},
