@@ -23,11 +23,10 @@ SOURCES = [
 ]
 
 BASE_URL = "https://www.smg.gov.mo"
-MAX_BYTES = 8 * 1024 * 1024 # 稍微放寬壓縮閾值
+MAX_BYTES = 8 * 1024 * 1024
 MAX_PAGES = 30
 LANGUAGES = [("zh", "中文"), ("en", "English"), ("pt", "Português")]
-# 增加更多無內容判定
-NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "Not Found"]
+NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "not found"]
 
 WAIT_IMAGES_JS = """
 () => new Promise(resolve => {
@@ -57,132 +56,106 @@ def get_target_month():
     return y, m
 
 def to_lang_url(url, lang):
-    # 更強健的語系替換邏輯
     for l in ["zh", "en", "pt"]:
         if f"/{l}/" in url:
             return url.replace(f"/{l}/", f"/{lang}/")
     return url
 
-def build_page_url(base_url, page_num):
-    if page_num <= 1: return base_url
-    return f"{base_url.rstrip('/')}/page/{page_num}"
-
-def clean_page(page):
-    page.evaluate("""() => {
-        const selectors = ['header', 'nav', 'footer', '.site-header', '.breadcrumb', '.navbar', '.footer-wrapper', '.header-wrapper'];
-        selectors.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
-    }""")
-    page.add_style_tag(content=PRINT_CSS)
-
 def sanitize_filename(filename, max_length=120):
-    if not filename: return "Untitled"
-    # 移除換行、多餘空格
+    if not filename or filename.strip() == "": return "Untitled"
     filename = re.sub(r'\s+', ' ', filename).strip()
-    # 移除非法字元
     filename = re.sub(r'[\\/*?:"<>|]', "", filename)
-    if len(filename) > max_length:
-        filename = filename[:max_length].strip()
-    return filename
+    return filename[:max_length]
 
 # ── 抓取核心 ────────────────────────────────────────────────────────────────
 
 def extract_article_links(page):
     results = []
-    # 擴大搜索範圍，適應 chat-info 等不同頁面結構
-    elements = page.query_selector_all("a[href*='news-detail']")
+    # 修正 1：擴大連結匹配範圍，包含 chat-info/ 數字結尾的連結
+    elements = page.query_selector_all("a[href*='-detail'], a[href*='chat-info/']")
     
     for el in elements:
         href = el.get_attribute("href")
-        if not href: continue
+        if not href or "page/" in href: continue # 排除分頁按鈕
+        
         full_url = href if href.startswith("http") else BASE_URL + href
         
-        # 抓取標題：優先找內部的標題元素，否則用 inner_text
-        title = el.evaluate("node => node.querySelector('.title, h3, h4')?.innerText || node.innerText")
+        # 修正 2：強化標題獲取，先找內部的 .title 或特定標籤
+        title = el.evaluate("node => node.querySelector('.title, .subject, h3, h4')?.innerText || node.innerText")
         title = title.split('\n')[0].strip()
         
-        # 尋找日期
-        container_text = el.evaluate("el => el.closest('li, tr, div.item, .list-item, .news-item')?.innerText || ''")
-        date_match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", container_text)
+        # 獲取日期
+        container = el.evaluate("el => el.closest('li, tr, div.item, .list-item, .news-item')?.innerText || ''")
+        date_match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", container)
         
         if date_match:
             date_str = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
             results.append({
                 "url": full_url,
-                "text": title if title else "無標題",
+                "text": title,
                 "date_str": date_str
             })
     return results
 
-def collect_items_from_source(page, source, target_y, target_m):
-    items = []
-    seen_urls = set()
-    for p_num in range(1, MAX_PAGES + 1):
-        url = build_page_url(source['url'], p_num)
-        log.info(f"  正在掃描 [{source['name']}]: {url}")
-        try:
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            # 針對 chat_info 這種可能加載較慢的頁面稍微等待
-            page.wait_for_timeout(1000)
-        except Exception:
-            break
-            
-        page_links = extract_article_links(page)
-        if not page_links: break
-        
-        stop_source = False
-        found_in_page = 0
-        for link in page_links:
-            if link['url'] in seen_urls: continue
-            try:
-                ly, lm = map(int, link['date_str'].split('-')[:2])
-                if ly == target_y and lm == target_m:
-                    items.append({**link, "source": source['name']})
-                    seen_urls.add(link['url'])
-                    found_in_page += 1
-                elif (ly < target_y) or (ly == target_y and lm < target_m):
-                    stop_source = True
-            except: continue
-            
-        log.info(f"  第 {p_num} 頁找到 {found_in_page} 篇目標文章")
-        if stop_source: break
-    return items
-
-# ── PDF 處理 ────────────────────────────────────────────────────────────────
-
-def download_pdf_versions(page, item, tmp_dir, idx):
-    downloaded = []
-    base_name = f"item_{idx:03d}"
+def download_and_merge_article(page, item, tmp_dir, individual_dir, seq):
+    """下載中英葡版本並合併為單一檔案"""
+    lang_pdfs = []
+    final_title = item['text']
     
     for lang, label in LANGUAGES:
         target_url = to_lang_url(item['url'], lang)
-        output_path = os.path.join(tmp_dir, f"{base_name}_{lang}.pdf")
+        temp_pdf = os.path.join(tmp_dir, f"temp_{seq}_{lang}.pdf")
         
         try:
-            log.info(f"    -> 正在下載 {label} 版...")
             page.goto(target_url, wait_until="networkidle", timeout=30000)
             
-            # 檢查是否真的有內容
+            # 修正 3：如果原本沒標題，在進入詳情頁時從頁面最大的 H 標籤抓取 (對應圖 2 的標題)
+            if not final_title or final_title == "無標題":
+                page_h_title = page.evaluate("() => document.querySelector('h1, h2, .news-detail-title, .title')?.innerText")
+                if page_h_title:
+                    final_title = page_h_title.strip()
+
+            # 檢查有無內容
             body_text = page.inner_text("body").lower()
-            if any(marker in body_text for marker in NO_CONTENT_MARKERS):
-                log.warning(f"    - {label} 版似乎無相關內容，跳過")
+            if any(m in body_text for m in NO_CONTENT_MARKERS):
                 continue
             
             page.evaluate(WAIT_IMAGES_JS)
-            clean_page(page)
+            # 移除導航欄等雜物
+            page.evaluate("""() => {
+                const s = ['header', 'nav', 'footer', '.site-header', '.breadcrumb', '.navbar', '.header-wrapper'];
+                s.forEach(sel => document.querySelectorAll(sel).forEach(el => el.remove()));
+            }""")
+            page.add_style_tag(content=PRINT_CSS)
             
             page.pdf(
-                path=output_path,
+                path=temp_pdf,
                 format="A4",
                 print_background=True,
                 margin={"top": "1.5cm", "bottom": "1.5cm", "left": "1.5cm", "right": "1.5cm"}
             )
             
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 2000:
-                downloaded.append(output_path)
+            if os.path.exists(temp_pdf) and os.path.getsize(temp_pdf) > 2000:
+                lang_pdfs.append(temp_pdf)
         except Exception as e:
-            log.error(f"    - {label} 版處理失敗: {e}")
-            
-    return downloaded
+            log.error(f"    - [{label}] 失敗: {e}")
+
+    if lang_pdfs:
+        # 修正 4：合併該文章的所有語系 PDF
+        clean_title = sanitize_filename(final_title)
+        output_name = f"{seq:02d}_{item['date_str']}_{clean_title}.pdf"
+        output_path = os.path.join(individual_dir, output_name)
+        
+        writer = PdfWriter()
+        for pdf in lang_pdfs:
+            reader = PdfReader(pdf)
+            for p in reader.pages:
+                writer.add_page(p)
+        
+        with open(output_path, "wb") as f:
+            writer.write(f)
+        return output_path
+    return None
 
 # ── 主程序 ──────────────────────────────────────────────────────────────────
 
@@ -190,90 +163,70 @@ def main(year=None, month=None):
     if not year or not month:
         year, month = get_target_month()
         
-    log.info(f"🚀 開始執行 SMG 報告抓取任務: {year}年{month:02d}月")
+    log.info(f"🚀 開始抓取 SMG 報告: {year}-{month:02d}")
     
     tmp_dir = f"smg_tmp_{year}_{month:02d}"
     individual_dir = f"SMG_Individual_News_{year}_{month:02d}"
-    
-    if os.path.exists(tmp_dir): shutil.rmtree(tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
-    if os.path.exists(individual_dir): shutil.rmtree(individual_dir)
     os.makedirs(individual_dir, exist_ok=True)
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # 模擬常見視窗大小
         context = browser.new_context(viewport={'width': 1280, 'height': 1600})
         page = context.new_page()
         
-        # 1. 收集
+        # 1. 搜集連結
         all_items = []
         for src in SOURCES:
-            all_items.extend(collect_items_from_source(page, src, year, month))
+            log.info(f"正在掃描來源: {src['name']}")
+            try:
+                page.goto(src['url'], wait_until="networkidle", timeout=30000)
+                # 簡單分頁處理
+                for p_num in range(1, 4): # 抓前 3 頁通常夠了
+                    if p_num > 1:
+                        new_url = f"{src['url'].rstrip('/')}/page/{p_num}"
+                        try:
+                            page.goto(new_url, wait_until="networkidle", timeout=10000)
+                        except: break
+                    
+                    found = extract_article_links(page)
+                    if not found: break
+                    
+                    for f in found:
+                        ly, lm = map(int, f['date_str'].split('-')[:2])
+                        if ly == year and lm == month:
+                            all_items.append(f)
+                        elif ly < year or (ly == year and lm < month):
+                            break
+            except Exception as e:
+                log.error(f"掃描 {src['name']} 出錯: {e}")
         
         # 2. 去重與排序
-        unique_urls = set()
-        deduplicated_items = []
-        for item in all_items:
-            if item['url'] not in unique_urls:
-                unique_urls.add(item['url'])
-                deduplicated_items.append(item)
+        unique_items = {x['url']: x for x in all_items}.values()
+        sorted_items = sorted(unique_items, key=lambda x: x['date_str'])
+        log.info(f"📊 找到 {len(sorted_items)} 篇符合條件的文章")
         
-        # 依日期排序
-        deduplicated_items.sort(key=lambda x: x['date_str'])
-        log.info(f"📊 篩選後共計 {len(deduplicated_items)} 篇文章")
+        # 3. 處理每篇文章 (合併語系)
+        final_files = []
+        for i, item in enumerate(sorted_items):
+            log.info(f"({i+1}/{len(sorted_items)}) 正在處理: {item['date_str']} - {item['text']}")
+            merged_path = download_and_merge_article(page, item, tmp_dir, individual_dir, i+1)
+            if merged_path:
+                final_files.append(merged_path)
         
-        # 3. 處理每一篇 (合併三語)
-        article_merged_paths = []
-        for i, item in enumerate(deduplicated_items):
-            seq = i + 1
-            clean_title = sanitize_filename(item['text'])
-            # 檔名：序號 + 日期 + 標題
-            final_filename = f"{seq:02d}_{item['date_str']}_{clean_title}.pdf"
-            final_path = os.path.join(individual_dir, final_filename)
-            
-            log.info(f"({seq}/{len(deduplicated_items)}) 處理文章: {item['text']}")
-            
-            # 抓取該文章的所有語系 PDF
-            lang_pdfs = download_pdf_versions(page, item, tmp_dir, i)
-            
-            if lang_pdfs:
-                # 在這裡執行「合併」操作：將中英葡 PDF 拼成一個檔案
-                writer = PdfWriter()
-                for pdf_file in lang_pdfs:
-                    reader = PdfReader(pdf_file)
-                    for pg in reader.pages:
-                        writer.add_page(pg)
-                
-                with open(final_path, "wb") as f:
-                    writer.write(f)
-                
-                article_merged_paths.append(final_path)
-                log.info(f"    ✅ 已合併多語系並存至: {final_filename}")
-            else:
-                log.warning(f"    ❌ 無法獲取任何語系內容: {item['text']}")
-            
         browser.close()
 
-    # 4. 生成最終總月報
-    if article_merged_paths:
-        output_filename = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
-        log.info(f"📦 正在製作最終總月報...")
-        
-        final_writer = PdfWriter()
-        for p in article_merged_paths:
-            final_writer.append(p)
-            
-        raw_final = os.path.join(tmp_dir, "raw_total.pdf")
-        with open(raw_final, "wb") as f:
-            final_writer.write(f)
-            
-        # 檢查是否需要壓縮 (調用之前定義的 gs 壓縮)
-        shutil.copy(raw_final, output_filename)
-        log.info(f"✨ 任務全部完成！總檔案：{output_filename}")
-        log.info(f"📂 獨立檔案已存放於：{individual_dir}")
+    # 4. 最終總月報
+    if final_files:
+        report_name = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
+        writer = PdfWriter()
+        for f in final_files:
+            writer.append(f)
+        with open(report_name, "wb") as f:
+            writer.write(f)
+        log.info(f"✅ 任務完成！檔案：{report_name}")
     else:
-        log.error("結束：未找到符合條件的內容。")
+        log.warning("❌ 未找到任何文章。")
 
 if __name__ == "__main__":
     import argparse
