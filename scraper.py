@@ -68,9 +68,16 @@ def clean_page(page):
     }""")
     page.add_style_tag(content=PRINT_CSS)
 
-def sanitize_filename(filename):
-    """清理檔名中的非法字元，確保存檔成功"""
-    return re.sub(r'[\\/*?:"<>|]', "_", filename)
+def sanitize_filename(filename, max_length=100):
+    """清理檔名中的非法字元、換行，並限制長度避免 OSError"""
+    # 1. 移除換行符、製表符
+    filename = re.sub(r'\s+', ' ', filename).strip()
+    # 2. 移除系統不允許的非法字元
+    filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    # 3. 截斷長度 (保留空間給序號和副檔名)
+    if len(filename) > max_length:
+        filename = filename[:max_length].strip() + "..."
+    return filename
 
 # ── 抓取核心 ────────────────────────────────────────────────────────────────
 
@@ -81,13 +88,18 @@ def extract_article_links(page):
         href = el.get_attribute("href")
         if not href: continue
         full_url = href if href.startswith("http") else BASE_URL + href
+        
+        # 抓取文字並只保留第一行作為標題
+        raw_text = el.inner_text().strip()
+        title = raw_text.split('\n')[0].strip()
+        
         container_text = el.evaluate("el => el.closest('li, tr, div.item, .list-item')?.innerText || ''")
         date_match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", container_text)
         if date_match:
             date_str = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
             results.append({
                 "url": full_url,
-                "text": el.inner_text().strip(),
+                "text": title,
                 "date_str": date_str
             })
     return results
@@ -200,6 +212,7 @@ def main(year=None, month=None):
         article_merged_files = []
         for i, item in enumerate(deduplicated_items):
             seq = i + 1
+            # 強化：清理標題並限制長度
             clean_title = sanitize_filename(item['text'])
             final_individual_name = f"{seq:02d}_{clean_title}.pdf"
             final_individual_path = os.path.join(individual_dir, final_individual_name)
