@@ -28,6 +28,7 @@ jobs:
           playwright install chromium
 
       - name: Compile application into standalone executable directory
+        shell: cmd
         run: |
           pyinstaller --noconfirm --onedir --console --name "SMG_Report_Generator" --add-data "%LOCALAPPDATA%\ms-playwright;ms-playwright" app.py
 
