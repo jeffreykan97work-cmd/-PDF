@@ -1,0 +1,39 @@
+name: Build Windows EXE Package
+
+on:
+  workflow_dispatch:
+    # Allows manual trigger from the GitHub Actions UI
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11 environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install required Python packages and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller flask playwright pypdf requests
+
+      - name: Download Playwright Chromium binaries
+        run: |
+          playwright install chromium
+
+      - name: Compile application into standalone executable directory
+        run: |
+          pyinstaller --noconfirm --onedir --console --name "SMG_Report_Generator" --add-data "%LOCALAPPDATA%\ms-playwright;ms-playwright" app.py
+
+      - name: Upload compiled package as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMG_Report_Generator_Windows_Build
+          path: dist/SMG_Report_Generator
+          retention-days: 7
