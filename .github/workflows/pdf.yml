@@ -2,30 +2,33 @@ name: SMG Monthly PDF Report
 
 on:
   schedule:
+    # Run at 01:00 UTC on the 1st of every month (generates previous month's report)
     - cron: '0 1 1 * *'
   workflow_dispatch:
     inputs:
       year:
-        description: '年份（留空=自動上個月）'
+        description: '年份 Year (leave blank = last month)'
         required: false
         default: ''
       month:
-        description: '月份（留空=自動上個月）'
+        description: '月份 Month (leave blank = last month)'
         required: false
         default: ''
 
 jobs:
   generate-report:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install system dependencies
         run: |
@@ -33,21 +36,19 @@ jobs:
           sudo apt-get install -y -q ghostscript
 
       - name: Install Python dependencies
-        run: pip install playwright pypdf
+        run: pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
+      - name: Install Playwright Chromium browser
         run: playwright install chromium --with-deps
 
       - name: Run scraper
         run: |
-          YEAR="${{ github.event.inputs.year }}"
-          MONTH="${{ github.event.inputs.month }}"
           ARGS=""
-          [ -n "$YEAR"  ] && ARGS="$ARGS --year $YEAR"
-          [ -n "$MONTH" ] && ARGS="$ARGS --month $MONTH"
+          [[ -n "${{ github.event.inputs.year }}"  ]] && ARGS="$ARGS --year ${{ github.event.inputs.year }}"
+          [[ -n "${{ github.event.inputs.month }}" ]] && ARGS="$ARGS --month ${{ github.event.inputs.month }}"
           python scraper.py $ARGS
 
-      - name: Upload PDF report
+      - name: Upload monthly report PDF
         uses: actions/upload-artifact@v4
         with:
           name: SMG-Monthly-Report
@@ -55,10 +56,10 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-      - name: Upload individual PDFs
+      - name: Upload individual article PDFs
         uses: actions/upload-artifact@v4
         with:
-          name: SMG-Individual-PDFs
+          name: SMG-Individual-Articles
           path: smg_tmp_*/
           retention-days: 30
           if-no-files-found: warn
