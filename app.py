@@ -57,7 +57,8 @@ MAX_SOURCE_PAGES = 5
 REQUEST_TIMEOUT = 30_000
 
 PDF_LINK_SELECTORS = ["a[href$='.pdf']", "a[href*='.pdf?']", "a[href*='/pdf/']", "a[href*='download']", "a[href*='attach']", "a[href*='file']"]
-NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "not found", "page not found"]
+# 移除了容易誤判的 "not found"
+NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "page not found"]
 
 PRINT_CSS = """
 @media print {
@@ -121,93 +122,83 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
 def extract_article_links(page: Page) -> list[dict]:
     results, seen_urls = [], set()
     
-    # 確保頁面加載完成，等待動態內容
-    page.wait_for_timeout(2000)
+    # 強制等待 Vue/React 動態渲染完成
+    page.wait_for_timeout(4000)
     
     items_data = page.evaluate("""() => {
         const DATE_RE = /(20\\d{2})[-\\/年\\s]+(\\d{1,2})[-\\/月\\s]+(\\d{1,2})/;
-        const data = [];
+        const results = [];
         
-        // 1. 地毯式搜索：遍歷整個網頁的所有純文字節點，直接找出包含日期的文字
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-        let node;
-        const textNodes = [];
-        while(node = walker.nextNode()) {
-            if(node.nodeValue && DATE_RE.test(node.nodeValue)) {
-                textNodes.push(node);
+        // 貪婪模式：獲取所有帶有超連結的元素
+        const links = Array.from(document.querySelectorAll('a, div[onclick]'));
+        
+        links.forEach(el => {
+            let href = el.getAttribute('href');
+            if (!href && el.getAttribute('onclick')) {
+                const m = el.getAttribute('onclick').match(/['"](.*?)['"]/);
+                if (m) href = m[1];
             }
-        }
-        
-        // 2. 向上錨定：對於每一個找到的日期，向上尋找包含它的「文章卡片容器」
-        textNodes.forEach(textNode => {
-            let container = textNode.parentElement;
-            let foundLinks = [];
-            let levelsUp = 0;
+            if (!href || href === '#' || href.includes('javascript:')) return;
             
-            // 向上找最多 8 層，直到找到一個包含超連結的容器
-            while (container && container.tagName !== 'BODY' && levelsUp < 8) {
-                const links = Array.from(container.querySelectorAll('a[href], [data-url], [onclick]'));
-                // 排除範圍太大的容器 (例如整頁選單)，通常一篇文章卡片內的連結不會超過 15 個
-                if (links.length > 0 && links.length < 15) { 
-                    foundLinks = links;
+            // 從超連結開始往上層找，找出包含這個超連結的卡片有沒有寫日期
+            let node = el;
+            let dateStr = null;
+            let title = (el.innerText || '').trim();
+            
+            for (let i = 0; i < 12; i++) {
+                if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
+                const text = node.innerText || '';
+                const match = text.match(DATE_RE);
+                if (match) {
+                    dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-' + match[3].padStart(2,'0');
+                    
+                    // 如果這個連結本身只是按鈕 ("閱讀更多") 或圖片 (沒文字)，則從容器抓取正確的標題
+                    if (title.length < 4 || title.includes('閱讀更多') || title.includes('詳情')) {
+                        const heading = node.querySelector('h1, h2, h3, h4, .title, .subject');
+                        if (heading) {
+                            title = heading.innerText.trim();
+                        } else {
+                            // 暴力拆解第一行非日期的文字作為標題
+                            const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 3 && !l.match(DATE_RE));
+                            if (lines.length > 0) title = lines[0];
+                        }
+                    }
                     break;
                 }
-                container = container.parentElement;
-                levelsUp++;
+                node = node.parentElement;
             }
             
-            // 3. 收網綁定：如果成功找到卡片容器和裡面的連結，就把它們綁定在一起
-            if (foundLinks.length > 0 && foundLinks.length < 15 && container) {
-                const match = textNode.nodeValue.match(DATE_RE);
-                const dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-' + match[3].padStart(2,'0');
-                
-                // 嘗試提取標題：過濾掉日期，取卡片內的第一行文字作為標題
-                let title = "Holiday Weather Article";
-                const lines = container.innerText.split('\\n').map(s => s.trim()).filter(s => s.length > 2);
-                for (let line of lines) {
-                    if (!line.match(/20\\d{2}[-\\/年]/)) {
-                        title = line;
-                        break;
-                    }
-                }
-                
-                foundLinks.forEach(el => {
-                    let href = el.getAttribute('href') || el.getAttribute('data-url');
-                    if (!href && el.getAttribute('onclick')) {
-                        const m = el.getAttribute('onclick').match(/['"](.*?)['"]/);
-                        if (m) href = m[1];
-                    }
-                    if (href && href !== '#' && !href.includes('javascript:') && !href.includes('/page/')) {
-                        data.push({ href: href, date_str: dateStr, text: title });
-                    }
-                });
+            if (dateStr) {
+                // 排除明顯無關的分頁連結
+                const hl = href.toLowerCase();
+                if (hl.includes('/page/') || hl.includes('?page=')) return;
+                results.push({ href: href, date_str: dateStr, text: title.substring(0, 150) });
             }
         });
-        return data;
+        
+        return results;
     }""")
 
     for item in items_data:
         href = item['href']
         hl = href.lower()
-        # 排除明顯非文章的連結
-        if hl.endswith(('.pdf', '.jpg', '.png', '.zip', '.doc', '.css', '.js')): continue
+        if hl.endswith(('.jpg', '.png', '.zip', '.css', '.js')): continue
         if any(x in hl for x in ['facebook.com', 'twitter.com', 'youtube.com', 'instagram.com']): continue
         
         full_url = resolve_url(href)
         
-        # URL 去重 (避免同一張卡片內同時點擊圖片和按鈕抓到兩次)
+        # URL 去重處理
         norm_url = full_url
         for lang in LANG_CODES: norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
         if norm_url in seen_urls: continue
         seen_urls.add(norm_url)
         
-        # 統一使用 zh 進行初始訪問
         zh_url = full_url
         for lang in LANG_CODES: zh_url = zh_url.replace(f"/{lang}/", "/zh/", 1)
         
         results.append({
             "url": zh_url,
-            "text": item['text'][:100], 
+            "text": item['text'] if item['text'] else "Article", 
             "date_str": item['date_str']
         })
         
@@ -244,8 +235,9 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
     for lang in LANG_CODES:
         try:
             page.goto(switch_lang(item["url"], lang), wait_until="networkidle", timeout=REQUEST_TIMEOUT)
-            # 二次確認標題，如果標題太短或有瑕疵則從內頁重新抓取
-            if not final_title or len(final_title) < 3 or "閱讀" in final_title or "詳情" in final_title or final_title == "Holiday Weather Article":
+            page.wait_for_timeout(2000) # 給予內頁渲染時間
+            
+            if not final_title or len(final_title) < 3 or "閱讀" in final_title or "詳情" in final_title or final_title == "Article":
                 h = page.evaluate("() => document.querySelector('h1, h2, .news-detail-title, .title')?.innerText || ''")
                 if h: final_title = h.strip()
             
@@ -269,6 +261,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
             dest = tmp_dir / f"{seq:03d}_{lang}_print.pdf"
             try:
                 page.goto(switch_lang(item["url"], lang), wait_until="networkidle", timeout=REQUEST_TIMEOUT)
+                page.wait_for_timeout(2000)
                 if any(m in page.inner_text("body").lower() for m in NO_CONTENT_MARKERS): continue
                 page.evaluate(WAIT_IMAGES_JS)
                 page.evaluate("""() => { ['header','nav','footer','.site-header','.breadcrumb','.navbar'].forEach(s => document.querySelectorAll(s).forEach(el => el.remove())); }""")
@@ -334,37 +327,33 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             for src in SOURCES:
                 log.info(f"📋 Scanning: {src['name']}")
                 for page_num in range(1, MAX_SOURCE_PAGES + 1):
+                    # 判斷是否需要附加分頁參數
                     page_url = src["url"] if page_num == 1 else f"{src['url'].rstrip('/')}/page/{page_num}"
-                    try: page.goto(page_url, wait_until="networkidle", timeout=REQUEST_TIMEOUT)
-                    except Exception: break
+                    try: 
+                        page.goto(page_url, wait_until="networkidle", timeout=REQUEST_TIMEOUT)
+                    except Exception as e: 
+                        log.warning(f"  Page {page_num} load error: {e}")
+                        break
                     
                     found = extract_article_links(page)
-                    if not found: break
+                    if not found: 
+                        log.info(f"  Page {page_num}: No links found, moving to next source.")
+                        break
 
                     added = 0
-                    newest_in_page_ym = (0, 0)
-                    oldest_in_page_ym = (9999, 12)
-
                     for item in found:
-                        try: ly, lm = int(item["date_str"][:4]), int(item["date_str"][5:7])
-                        except Exception: continue
+                        try: 
+                            ly, lm = int(item["date_str"][:4]), int(item["date_str"][5:7])
+                        except Exception: 
+                            continue
+                        
                         if ly == year and lm == month and item["url"] not in all_items:
                             all_items[item["url"]] = item
                             added += 1
-                        if (ly, lm) > newest_in_page_ym:
-                            newest_in_page_ym = (ly, lm)
-                        if (ly, lm) < oldest_in_page_ym:
-                            oldest_in_page_ym = (ly, lm)
 
-                    log.info(
-                        f"  Page {page_num}: {len(found)} links, {added} matched {year}-{month:02d} "
-                        f"(range {oldest_in_page_ym[0]}-{oldest_in_page_ym[1]:02d} → "
-                        f"{newest_in_page_ym[0]}-{newest_in_page_ym[1]:02d})"
-                    )
-
-                    if newest_in_page_ym < (year, month):
-                        log.info(f"  Newest article ({newest_in_page_ym}) is before target — stopping pagination")
-                        break
+                    log.info(f"  Page {page_num}: Found {len(found)} candidate links. Matched {year}-{month:02d}: {added}")
+                    
+                    # 【重要修正】移除了原先會因為日期提早 break 的邏輯，強制跑滿 MAX_SOURCE_PAGES 或直到該頁面完全無數據為止
             
             sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
             if not sorted_items:
@@ -374,13 +363,13 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             
             article_pdfs = []
             for idx, item in enumerate(sorted_items, 1):
-                log.info(f"⚙ Processing ({idx}/{len(sorted_items)}) {item['date_str']}")
+                log.info(f"⚙ Processing ({idx}/{len(sorted_items)}) [{item['date_str']}] {item['text']}")
                 pdf = process_article(page, item, tmp_dir, tmp_dir, idx, session)
                 if pdf: article_pdfs.append(pdf)
             browser.close()
             
         if not article_pdfs:
-            scraper_execution_result = {"success": False, "filename": "", "message": "No PDFs generated."}
+            scraper_execution_result = {"success": False, "filename": "", "message": "No PDFs generated (Check if pages contain actual content)."}
             return
             
         raw = tmp_dir / "raw_merged.pdf"
