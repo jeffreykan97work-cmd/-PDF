@@ -18,13 +18,10 @@ from playwright.sync_api import Browser, Page, sync_playwright, TimeoutError as 
 from pypdf import PdfReader, PdfWriter
 
 # ── PyInstaller Playwright Path Configuration ────────────────────────────────
-# This tells the script where to find the bundled Chromium browser when running as an .exe
 if getattr(sys, 'frozen', False):
-    # Running inside a PyInstaller bundle
     bundle_dir = sys._MEIPASS
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(bundle_dir, 'ms-playwright')
 else:
-    # Running in normal Python environment
     bundle_dir = os.path.dirname(os.path.abspath(__file__))
 
 # ── Logging and Memory Buffer Setup ──────────────────────────────────────────
@@ -123,6 +120,12 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
         return False
 
 def extract_article_links(page: Page) -> list[dict]:
+    """
+    FIX (Bug #1): Date extraction now walks UP the DOM tree through multiple
+    ancestor levels. The original el.closest('... div') matched the anchor's
+    immediate parent <div> (which rarely contains the date text), causing dates
+    to be missed and articles to be silently skipped.
+    """
     results, seen_urls = [], set()
     for el in page.query_selector_all(ARTICLE_LINK_SELECTOR):
         try:
@@ -131,10 +134,27 @@ def extract_article_links(page: Page) -> list[dict]:
             full_url = resolve_url(href)
             if full_url in seen_urls: continue
             title = (el.evaluate("node => node.querySelector('.title, .subject, h3, h4, h2')?.innerText || node.innerText") or "").split("\n")[0].strip()
-            container = el.evaluate("el => el.closest('li, tr, div.item, .list-item, .news-item, div')?.innerText || ''")
-            date_match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", container)
-            if not date_match: continue
-            date_str = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
+
+            # Walk up the DOM tree (up to 8 levels) to find a date string
+            date_str = el.evaluate("""el => {
+                const DATE_RE = /(\\d{4})[-\\/](\\d{1,2})[-\\/](\\d{1,2})/;
+                let node = el;
+                for (let i = 0; i < 8; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const text = node.innerText || '';
+                    const m = text.match(DATE_RE);
+                    if (m) {
+                        const y  = m[1].padStart(4, '0');
+                        const mo = m[2].padStart(2, '0');
+                        const d  = m[3].padStart(2, '0');
+                        return y + '-' + mo + '-' + d;
+                    }
+                }
+                return null;
+            }""")
+
+            if not date_str: continue
             seen_urls.add(full_url)
             results.append({"url": full_url, "text": title, "date_str": date_str})
         except Exception: continue
@@ -244,7 +264,6 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
         if not year or not month: year, month = get_target_month()
         log.info(f"🚀 Execution launched — target: {year}-{month:02d}")
         
-        # Determine current working directory (where the .exe is located) to save PDFs
         current_dir = Path(os.getcwd())
         tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
         tmp_dir.mkdir(exist_ok=True)
@@ -264,15 +283,38 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                     try: page.goto(page_url, wait_until="networkidle", timeout=REQUEST_TIMEOUT)
                     except Exception: break
                     
-                    found, added, oldest_ym = extract_article_links(page), 0, (9999, 12)
+                    found = extract_article_links(page)
                     if not found: break
+
+                    added = 0
+                    # ── FIX #2: Track newest AND oldest dates per page ────────
+                    # Original bug: broke pagination when ANY article was older
+                    # than target month, causing page 1 to always be the last
+                    # page scanned (since pages mix months).
+                    # Fix: only stop when NEWEST article on page is before target.
+                    newest_in_page_ym = (0, 0)
+                    oldest_in_page_ym = (9999, 12)
+
                     for item in found:
                         try: ly, lm = int(item["date_str"][:4]), int(item["date_str"][5:7])
                         except Exception: continue
                         if ly == year and lm == month and item["url"] not in all_items:
                             all_items[item["url"]] = item
-                        if (ly, lm) < oldest_ym: oldest_ym = (ly, lm)
-                    if oldest_ym < (year, month): break
+                            added += 1
+                        if (ly, lm) > newest_in_page_ym:
+                            newest_in_page_ym = (ly, lm)
+                        if (ly, lm) < oldest_in_page_ym:
+                            oldest_in_page_ym = (ly, lm)
+
+                    log.info(
+                        f"  Page {page_num}: {len(found)} links, {added} matched {year}-{month:02d} "
+                        f"(range {oldest_in_page_ym[0]}-{oldest_in_page_ym[1]:02d} → "
+                        f"{newest_in_page_ym[0]}-{newest_in_page_ym[1]:02d})"
+                    )
+
+                    if newest_in_page_ym < (year, month):
+                        log.info(f"  Newest article ({newest_in_page_ym}) is before target — stopping pagination")
+                        break
             
             sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
             if not sorted_items:
@@ -396,12 +438,10 @@ def get_engine_status_endpoint(): return jsonify({"running": scraper_running_sta
 def poll_logs_endpoint(): return jsonify({"logs": app_log_buffer[request.args.get('offset', 0, type=int):]})
 @app.route('/retrieve-file')
 def retrieve_file_endpoint(): 
-    # Read the file from the current working directory
     file_path = Path(os.getcwd()) / request.args.get('file', '')
     return send_file(file_path, as_attachment=True)
 
 if __name__ == "__main__":
-    # Automatically open the browser when the .exe is launched
     print("Starting server and opening browser...")
     threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
