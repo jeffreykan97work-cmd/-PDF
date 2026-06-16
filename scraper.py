@@ -161,20 +161,23 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
 def extract_article_links(page: Page) -> list[dict]:
     """
     Extract article links from the current listing page.
-    Uses the selector pattern proven to work on SMG: a[href*='-detail'], a[href*='chat-info/']
 
-    Date extraction strategy (v3 — article-count guard):
-    Walk UP the DOM from each anchor. At every level that contains a date, also
-    count how many article links (our selector) live inside that node.
+    Date extraction strategy (v4 — language-aware unique-article guard):
 
-    If count == 1  → this node is the per-article row/card; the date belongs to
-                     THIS article. Use it and stop.
-    If count  > 1  → shared container (e.g. the whole <ul> or page <section>);
-                     the date found is the FIRST article's date, not ours.
-                     Keep climbing.
+    Root cause of v3 failure on seasonal/subpage sources:
+      SMG listing pages often show each article with THREE language-variant links:
+        <li>
+          <span>2026-04-15</span>
+          <a href="/zh/seasonal/abc-detail">中文</a>
+          <a href="/en/seasonal/abc-detail">English</a>
+          <a href="/pt/seasonal/abc-detail">Português</a>
+        </li>
+      v3 counted querySelectorAll(ART_SEL).length = 3 → "shared container" → skipped.
+      Every level above also has artCount > 1, so null was always returned.
 
-    This fixes the core mis-dating bug: a shared <ul> with 10 articles returns
-    the first article's date for every anchor inside it via innerText + regex.
+    Fix: when counting article links inside a container, strip the language prefix
+    (/zh/, /en/, /pt/) and count DISTINCT normalised paths.  Three language links
+    for the same article normalise to ONE path → uniqueCount = 1 → accepted.
     """
     results: list[dict] = []
     seen_urls: set[str] = set()
@@ -189,7 +192,11 @@ def extract_article_links(page: Page) -> list[dict]:
                 continue
 
             full_url = resolve_url(href)
-            if full_url in seen_urls:
+            # Normalise to zh version for deduplication across language variants
+            norm_url = full_url
+            for lang in LANG_CODES:
+                norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
+            if norm_url in seen_urls:
                 continue
 
             # Title: try child elements first, then the anchor's own text
@@ -199,31 +206,45 @@ def extract_article_links(page: Page) -> list[dict]:
             )
             title = (title or "").split("\n")[0].strip()
 
-            # Walk up DOM; only accept date from a node that contains exactly this article
+            # Walk up DOM; accept date only from a node that contains exactly ONE
+            # unique article (after stripping language prefix from all hrefs).
             date_str = el.evaluate("""el => {
                 const DATE_RE = /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/;
-                const ART_SEL = "a[href*='-detail'], a[href*='chat-info/']";
-                let node = el;
+                const ART_SEL = "a[href*=\'-detail\'], a[href*=\'chat-info/\']";
 
+                function normHref(href) {
+                    // Strip language prefix so /zh/x /en/x /pt/x all become /x
+                    return href.replace(/\/(zh|en|pt)\//, '/');
+                }
+
+                function uniqueArticleCount(node) {
+                    const links = node.querySelectorAll(ART_SEL);
+                    const paths = new Set();
+                    links.forEach(a => {
+                        const h = a.getAttribute('href') || '';
+                        if (h) paths.add(normHref(h));
+                    });
+                    return paths.size;
+                }
+
+                let node = el;
                 for (let i = 0; i < 12; i++) {
                     node = node.parentElement;
                     if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
 
                     const text = node.innerText || '';
                     const m = text.match(DATE_RE);
-                    if (!m) continue;   // no date at this level, keep going
+                    if (!m) continue;   // no date at this level, keep climbing
 
-                    // Date found — is this node exclusive to one article?
-                    const artCount = node.querySelectorAll(ART_SEL).length;
-                    if (artCount <= 1) {
-                        // Safe: this container holds only our article
+                    // Date found — check if this node exclusively belongs to one article
+                    const uniq = uniqueArticleCount(node);
+                    if (uniq <= 1) {
                         const y  = m[1].padStart(4, '0');
                         const mo = m[2].padStart(2, '0');
                         const d  = m[3].padStart(2, '0');
                         return y + '-' + mo + '-' + d;
                     }
-                    // artCount > 1: shared container — the date may belong to another
-                    // article. Keep climbing to find the exclusive per-article node.
+                    // Multiple distinct articles — shared container, keep climbing
                 }
                 return null;
             }""")
@@ -232,8 +253,12 @@ def extract_article_links(page: Page) -> list[dict]:
                 log.debug(f"  No date found for: {full_url}")
                 continue
 
-            seen_urls.add(full_url)
-            results.append({"url": full_url, "text": title, "date_str": date_str})
+            seen_urls.add(norm_url)
+            # Always store the zh URL so process_article can switch languages itself
+            zh_url = full_url
+            for lang in LANG_CODES:
+                zh_url = zh_url.replace(f"/{lang}/", "/zh/", 1)
+            results.append({"url": zh_url, "text": title, "date_str": date_str})
 
         except Exception as exc:
             log.debug(f"  Link extraction error: {exc}")
