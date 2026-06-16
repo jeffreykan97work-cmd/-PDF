@@ -443,4 +443,21 @@ def main(year: Optional[int], month: Optional[int]):
         log.warning("❌ No PDFs generated.")
         return
         
-    log.info(f"\n📎
+    log.info(f"\n📎 Merging {len(article_pdfs)} PDFs…")
+    raw = tmp_dir / "raw_merged.pdf"
+    writer = PdfWriter()
+    for f in article_pdfs:
+        try: writer.append(str(f))
+        except Exception: pass
+    with raw.open("wb") as f: writer.write(f)
+    
+    final_filename = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
+    final = ensure_size_limit(raw, current_dir / final_filename)
+    log.info(f"\n✅ Done → {final.name} ({final.stat().st_size/1024/1024:.2f} MB)")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--year",  type=int, default=None)
+    parser.add_argument("--month", type=int, default=None)
+    args = parser.parse_args()
+    main(args.year, args.month)
