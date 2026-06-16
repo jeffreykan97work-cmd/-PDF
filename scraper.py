@@ -305,34 +305,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
     with article_pdf.open("wb") as f: writer.write(f)
     return article_pdf
 
-def compress_with_ghostscript(src: Path, dst: Path, quality: str = "/ebook") -> bool:
-    if not shutil.which("gs"):
-        return False
-    try:
-        subprocess.run(
-            ["gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-             f"-dPDFSETTINGS={quality}", "-dNOPAUSE", "-dQUIET", "-dBATCH",
-             f"-sOutputFile={dst}", str(src)],
-            check=True, capture_output=True,
-        )
-        return dst.exists() and dst.stat().st_size > 1000
-    except Exception as exc:
-        log.warning(f"  Ghostscript failed: {exc}")
-        return False
-
 def ensure_size_limit(src: Path, final_path: Path) -> Path:
-    src_mb = src.stat().st_size / 1024 / 1024
-    if src.stat().st_size <= MAX_FINAL_BYTES:
-        shutil.copy(src, final_path)
-        return final_path
-
-    log.info(f"  {src_mb:.2f} MB > Limit — compressing…")
-    tmp_gs = final_path.with_suffix(".gs.pdf")
-    if compress_with_ghostscript(src, tmp_gs, "/ebook"):
-        if tmp_gs.stat().st_size <= MAX_FINAL_BYTES:
-            shutil.move(str(tmp_gs), final_path)
-            return final_path
-    
     shutil.copy(src, final_path)
     return final_path
 
@@ -340,7 +313,7 @@ def main(year: Optional[int], month: Optional[int]):
     if not year or not month:
         year, month = get_target_month()
         
-    log.info(f"🚀 [SUPER-V6 CLI] Execution launched — target: {year}-{month:02d}")
+    log.info(f"🚀 [SUPER-V6 CLI w/ Early Stop] Execution launched — target: {year}-{month:02d}")
     
     current_dir = Path(os.getcwd())
     tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
@@ -372,11 +345,17 @@ def main(year: Optional[int], month: Optional[int]):
                     break
 
                 added = 0
+                stop_pagination = False  # 🚀 新增：早停標記
+                
                 for item in found:
                     try: 
                         ly, lm = int(item["date_str"][:4]), int(item["date_str"][5:7])
                     except Exception: 
                         continue
+                    
+                    # 🚀 早停檢查：如果發現文章日期早於目標年月，標記並準備退出
+                    if (ly, lm) < (year, month):
+                        stop_pagination = True
                     
                     is_live = "Live/" in item["text"]
                     if (ly == year and lm == month) or is_live:
@@ -386,6 +365,11 @@ def main(year: Optional[int], month: Optional[int]):
 
                 log.info(f"  Page {page_num}: Processed {len(found)} links. Matched: {added}")
                 
+                # 🚀 若觸發早停，直接中止此分類的掃描，不點下一頁
+                if stop_pagination:
+                    log.info(f"  [Early Stop] Reached older articles (< {year}-{month:02d}). Stopping pagination for {src['name']}.")
+                    break
+
                 # 模擬點擊下一頁
                 try:
                     action = page.evaluate("""() => {
