@@ -56,8 +56,6 @@ MAX_FINAL_BYTES = 5 * 1024 * 1024
 MAX_SOURCE_PAGES = 5
 REQUEST_TIMEOUT = 30_000
 
-# 【修改點 1】放寬文章連結篩選條件，加入對 Holiday_weather 和一般 news 的兼容
-ARTICLE_LINK_SELECTOR = "a[href*='-detail'], a[href*='chat-info/'], a[href*='Holiday_weather'], a[href*='/news/']"
 PDF_LINK_SELECTORS = ["a[href$='.pdf']", "a[href*='.pdf?']", "a[href*='/pdf/']", "a[href*='download']", "a[href*='attach']", "a[href*='file']"]
 NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "not found", "page not found"]
 
@@ -122,52 +120,97 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
 
 def extract_article_links(page: Page) -> list[dict]:
     results, seen_urls = [], set()
-    for el in page.query_selector_all(ARTICLE_LINK_SELECTOR):
-        try:
-            href = el.get_attribute("href") or ""
-            if not href or "page/" in href: continue
-            full_url = resolve_url(href)
-            norm_url = full_url
-            for lang in LANG_CODES:
-                norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
-            if norm_url in seen_urls: continue
-
-            title = (el.evaluate("node => node.querySelector('.title, .subject, h3, h4, h2')?.innerText || node.innerText") or "").split("\n")[0].strip()
-
-            # 【修改點 2 & 3】優化 JS：支援「年月日」中文日期格式，並提高防重複機制的容錯率
-            date_str = el.evaluate("""el => {
-                const DATE_RE = /(\d{4})[-\/年\s]+(\d{1,2})[-\/月\s]+(\d{1,2})/;
-                const ART_SEL = "a[href*=\'-detail\'], a[href*=\'chat-info/\'], a[href*=\'Holiday_weather\'], a[href*=\'/news/\']";
-                function normHref(href) { return href.replace(/\/(zh|en|pt)\//, '/'); }
-                function uniqueArticleCount(node) {
-                    const paths = new Set();
-                    node.querySelectorAll(ART_SEL).forEach(a => {
-                        const h = a.getAttribute('href') || '';
-                        if (h) paths.add(normHref(h));
-                    });
-                    return paths.size;
+    
+    # 確保頁面加載完成，等待動態內容
+    page.wait_for_timeout(2000)
+    
+    items_data = page.evaluate("""() => {
+        const DATE_RE = /(20\\d{2})[-\\/年\\s]+(\\d{1,2})[-\\/月\\s]+(\\d{1,2})/;
+        const data = [];
+        
+        // 1. 地毯式搜索：遍歷整個網頁的所有純文字節點，直接找出包含日期的文字
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        let node;
+        const textNodes = [];
+        while(node = walker.nextNode()) {
+            if(node.nodeValue && DATE_RE.test(node.nodeValue)) {
+                textNodes.push(node);
+            }
+        }
+        
+        // 2. 向上錨定：對於每一個找到的日期，向上尋找包含它的「文章卡片容器」
+        textNodes.forEach(textNode => {
+            let container = textNode.parentElement;
+            let foundLinks = [];
+            let levelsUp = 0;
+            
+            // 向上找最多 8 層，直到找到一個包含超連結的容器
+            while (container && container.tagName !== 'BODY' && levelsUp < 8) {
+                const links = Array.from(container.querySelectorAll('a[href], [data-url], [onclick]'));
+                // 排除範圍太大的容器 (例如整頁選單)，通常一篇文章卡片內的連結不會超過 15 個
+                if (links.length > 0 && links.length < 15) { 
+                    foundLinks = links;
+                    break;
                 }
-                let node = el;
-                for (let i = 0; i < 15; i++) { // 增加向上遍歷的層數
-                    node = node.parentElement;
-                    if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
-                    const text = node.innerText || '';
-                    const m = text.match(DATE_RE);
-                    if (!m) continue;
-                    if (uniqueArticleCount(node) <= 5) { // 提高容錯率至 5 篇
-                        return m[1].padStart(4,'0')+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');
+                container = container.parentElement;
+                levelsUp++;
+            }
+            
+            // 3. 收網綁定：如果成功找到卡片容器和裡面的連結，就把它們綁定在一起
+            if (foundLinks.length > 0 && foundLinks.length < 15 && container) {
+                const match = textNode.nodeValue.match(DATE_RE);
+                const dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-' + match[3].padStart(2,'0');
+                
+                // 嘗試提取標題：過濾掉日期，取卡片內的第一行文字作為標題
+                let title = "Holiday Weather Article";
+                const lines = container.innerText.split('\\n').map(s => s.trim()).filter(s => s.length > 2);
+                for (let line of lines) {
+                    if (!line.match(/20\\d{2}[-\\/年]/)) {
+                        title = line;
+                        break;
                     }
                 }
-                return null;
-            }""")
+                
+                foundLinks.forEach(el => {
+                    let href = el.getAttribute('href') || el.getAttribute('data-url');
+                    if (!href && el.getAttribute('onclick')) {
+                        const m = el.getAttribute('onclick').match(/['"](.*?)['"]/);
+                        if (m) href = m[1];
+                    }
+                    if (href && href !== '#' && !href.includes('javascript:') && !href.includes('/page/')) {
+                        data.push({ href: href, date_str: dateStr, text: title });
+                    }
+                });
+            }
+        });
+        return data;
+    }""")
 
-            if not date_str: continue
-            seen_urls.add(norm_url)
-            zh_url = full_url
-            for lang in LANG_CODES:
-                zh_url = zh_url.replace(f"/{lang}/", "/zh/", 1)
-            results.append({"url": zh_url, "text": title, "date_str": date_str})
-        except Exception: continue
+    for item in items_data:
+        href = item['href']
+        hl = href.lower()
+        # 排除明顯非文章的連結
+        if hl.endswith(('.pdf', '.jpg', '.png', '.zip', '.doc', '.css', '.js')): continue
+        if any(x in hl for x in ['facebook.com', 'twitter.com', 'youtube.com', 'instagram.com']): continue
+        
+        full_url = resolve_url(href)
+        
+        # URL 去重 (避免同一張卡片內同時點擊圖片和按鈕抓到兩次)
+        norm_url = full_url
+        for lang in LANG_CODES: norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
+        if norm_url in seen_urls: continue
+        seen_urls.add(norm_url)
+        
+        # 統一使用 zh 進行初始訪問
+        zh_url = full_url
+        for lang in LANG_CODES: zh_url = zh_url.replace(f"/{lang}/", "/zh/", 1)
+        
+        results.append({
+            "url": zh_url,
+            "text": item['text'][:100], 
+            "date_str": item['date_str']
+        })
+        
     return results
 
 def find_pdf_links_on_page(page: Page) -> list[str]:
@@ -201,9 +244,11 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
     for lang in LANG_CODES:
         try:
             page.goto(switch_lang(item["url"], lang), wait_until="networkidle", timeout=REQUEST_TIMEOUT)
-            if not final_title or len(final_title) < 3:
+            # 二次確認標題，如果標題太短或有瑕疵則從內頁重新抓取
+            if not final_title or len(final_title) < 3 or "閱讀" in final_title or "詳情" in final_title or final_title == "Holiday Weather Article":
                 h = page.evaluate("() => document.querySelector('h1, h2, .news-detail-title, .title')?.innerText || ''")
                 if h: final_title = h.strip()
+            
             if any(m in page.inner_text("body").lower() for m in NO_CONTENT_MARKERS): continue
             pdf_urls = find_pdf_links_on_page(page)
             if pdf_urls: lang_pdf_map[lang].extend(pdf_urls)
@@ -323,7 +368,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             
             sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
             if not sorted_items:
-                scraper_execution_result = {"success": False, "filename": "", "message": "No matching articles found."}
+                scraper_execution_result = {"success": False, "filename": "", "message": f"No matching articles found for {year}-{month:02d}."}
                 browser.close()
                 return
             
