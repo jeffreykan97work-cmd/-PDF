@@ -121,10 +121,12 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
 
 def extract_article_links(page: Page) -> list[dict]:
     """
-    FIX (Bug #1): Date extraction now walks UP the DOM tree through multiple
-    ancestor levels. The original el.closest('... div') matched the anchor's
-    immediate parent <div> (which rarely contains the date text), causing dates
-    to be missed and articles to be silently skipped.
+    Date extraction strategy (v3 — article-count guard):
+    Walk UP the DOM from each anchor. At every level that contains a date, also
+    count how many article links (our selector) live inside that node.
+    If count == 1 → this node is the per-article row/card; date is correct.
+    If count  > 1 → shared container; keep climbing to find exclusive node.
+    Fixes: shared <ul> returning the first article's date for ALL articles.
     """
     results, seen_urls = [], set()
     for el in page.query_selector_all(ARTICLE_LINK_SELECTOR):
@@ -135,16 +137,18 @@ def extract_article_links(page: Page) -> list[dict]:
             if full_url in seen_urls: continue
             title = (el.evaluate("node => node.querySelector('.title, .subject, h3, h4, h2')?.innerText || node.innerText") or "").split("\n")[0].strip()
 
-            # Walk up the DOM tree (up to 8 levels) to find a date string
             date_str = el.evaluate("""el => {
-                const DATE_RE = /(\\d{4})[-\\/](\\d{1,2})[-\\/](\\d{1,2})/;
+                const DATE_RE = /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/;
+                const ART_SEL = "a[href*='-detail'], a[href*='chat-info/']";
                 let node = el;
-                for (let i = 0; i < 8; i++) {
+                for (let i = 0; i < 12; i++) {
                     node = node.parentElement;
-                    if (!node) break;
+                    if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
                     const text = node.innerText || '';
                     const m = text.match(DATE_RE);
-                    if (m) {
+                    if (!m) continue;
+                    const artCount = node.querySelectorAll(ART_SEL).length;
+                    if (artCount <= 1) {
                         const y  = m[1].padStart(4, '0');
                         const mo = m[2].padStart(2, '0');
                         const d  = m[3].padStart(2, '0');
