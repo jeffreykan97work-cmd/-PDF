@@ -56,7 +56,8 @@ MAX_FINAL_BYTES = 5 * 1024 * 1024
 MAX_SOURCE_PAGES = 5
 REQUEST_TIMEOUT = 30_000
 
-ARTICLE_LINK_SELECTOR = "a[href*='-detail'], a[href*='chat-info/']"
+# 【修改點 1】放寬文章連結篩選條件，加入對 Holiday_weather 和一般 news 的兼容
+ARTICLE_LINK_SELECTOR = "a[href*='-detail'], a[href*='chat-info/'], a[href*='Holiday_weather'], a[href*='/news/']"
 PDF_LINK_SELECTORS = ["a[href$='.pdf']", "a[href*='.pdf?']", "a[href*='/pdf/']", "a[href*='download']", "a[href*='attach']", "a[href*='file']"]
 NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "not found", "page not found"]
 
@@ -120,11 +121,6 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
         return False
 
 def extract_article_links(page: Page) -> list[dict]:
-    """
-    v4: language-aware unique-article guard.
-    SMG shows zh/en/pt links per article; strip lang prefix before counting
-    unique articles per container, so 3 language links → 1 unique article → accepted.
-    """
     results, seen_urls = [], set()
     for el in page.query_selector_all(ARTICLE_LINK_SELECTOR):
         try:
@@ -138,9 +134,10 @@ def extract_article_links(page: Page) -> list[dict]:
 
             title = (el.evaluate("node => node.querySelector('.title, .subject, h3, h4, h2')?.innerText || node.innerText") or "").split("\n")[0].strip()
 
+            # 【修改點 2 & 3】優化 JS：支援「年月日」中文日期格式，並提高防重複機制的容錯率
             date_str = el.evaluate("""el => {
-                const DATE_RE = /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/;
-                const ART_SEL = "a[href*=\'-detail\'], a[href*=\'chat-info/\']";
+                const DATE_RE = /(\d{4})[-\/年\s]+(\d{1,2})[-\/月\s]+(\d{1,2})/;
+                const ART_SEL = "a[href*=\'-detail\'], a[href*=\'chat-info/\'], a[href*=\'Holiday_weather\'], a[href*=\'/news/\']";
                 function normHref(href) { return href.replace(/\/(zh|en|pt)\//, '/'); }
                 function uniqueArticleCount(node) {
                     const paths = new Set();
@@ -151,13 +148,13 @@ def extract_article_links(page: Page) -> list[dict]:
                     return paths.size;
                 }
                 let node = el;
-                for (let i = 0; i < 12; i++) {
+                for (let i = 0; i < 15; i++) { // 增加向上遍歷的層數
                     node = node.parentElement;
                     if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
                     const text = node.innerText || '';
                     const m = text.match(DATE_RE);
                     if (!m) continue;
-                    if (uniqueArticleCount(node) <= 1) {
+                    if (uniqueArticleCount(node) <= 5) { // 提高容錯率至 5 篇
                         return m[1].padStart(4,'0')+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');
                     }
                 }
@@ -300,11 +297,6 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                     if not found: break
 
                     added = 0
-                    # ── FIX #2: Track newest AND oldest dates per page ────────
-                    # Original bug: broke pagination when ANY article was older
-                    # than target month, causing page 1 to always be the last
-                    # page scanned (since pages mix months).
-                    # Fix: only stop when NEWEST article on page is before target.
                     newest_in_page_ym = (0, 0)
                     oldest_in_page_ym = (9999, 12)
 
