@@ -108,7 +108,6 @@ def download_pdf(url: str, dest: Path, page: Page) -> bool:
             return False
         
         content = r.body()
-        # 簡單校驗是否為 PDF 檔案內容，或者至少不是空檔
         if not content.startswith(b"%PDF") and b"pdf" not in r.headers.get("content-type", "").lower() and not url.lower().endswith(".pdf"):
             return False
             
@@ -259,233 +258,24 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
             dest = tmp_dir / f"{seq:03d}_{lang}_print.pdf"
             try:
                 page.goto(switch_lang(item["url"], lang), wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)
+                
+                # 【修復重點】：深度滾動渲染機制，確保所有圖片及天氣圖表完全載入後才生成 PDF
+                page.evaluate("""() => new Promise((resolve) => {
+                    let totalHeight = 0;
+                    let distance = 300;
+                    let timer = setInterval(() => {
+                        let scrollHeight = document.body.scrollHeight;
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        if(totalHeight >= scrollHeight){
+                            clearInterval(timer);
+                            window.scrollTo(0, 0);
+                            setTimeout(resolve, 1500);
+                        }
+                    }, 150);
+                })""")
+                
                 if any(m in page.inner_text("body").lower() for m in NO_CONTENT_MARKERS): continue
                 page.evaluate(WAIT_IMAGES_JS)
                 page.evaluate("""() => { ['header','nav','footer','.site-header','.breadcrumb','.navbar'].forEach(s => document.querySelectorAll(s).forEach(el => el.remove())); }""")
-                page.add_style_tag(content=PRINT_CSS)
-                page.pdf(path=str(dest), format="A4", print_background=True, margin={"top": "1.5cm", "bottom": "1.5cm", "left": "1.5cm", "right": "1.5cm"})
-                if dest.exists() and dest.stat().st_size > 2000: collected.append((dest, LANG_CODES.index(lang)))
-            except Exception as exc: log.warning(f"    [{lang}] print-to-PDF failed")
-
-    if not collected: return None
-    collected.sort(key=lambda x: x[1])
-    article_pdf = out_dir / f"{seq:03d}_{item['date_str']}_{sanitize_filename(final_title)}.pdf"
-    writer = PdfWriter()
-    for pdf_path, _ in collected:
-        try:
-            for p in PdfReader(str(pdf_path)).pages: writer.add_page(p)
-        except Exception: continue
-    if not writer.pages: return None
-    with article_pdf.open("wb") as f: writer.write(f)
-    return article_pdf
-
-def compress_with_pypdf(src: Path, dst: Path) -> bool:
-    try:
-        writer = PdfWriter()
-        for page in PdfReader(str(src)).pages:
-            page.compress_content_streams()
-            writer.add_page(page)
-        writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
-        with dst.open("wb") as f: writer.write(f)
-        return dst.exists() and dst.stat().st_size > 1000
-    except Exception: return False
-
-def ensure_size_limit(src: Path, final_path: Path) -> Path:
-    if src.stat().st_size <= MAX_FINAL_BYTES:
-        shutil.copy(src, final_path)
-        return final_path
-    log.info("  Compressing oversized file...")
-    tmp_py = final_path.with_suffix(".py.pdf")
-    if compress_with_pypdf(src, tmp_py) and tmp_py.stat().st_size <= MAX_FINAL_BYTES:
-        shutil.move(str(tmp_py), final_path)
-        return final_path
-    shutil.copy(src, final_path)
-    return final_path
-
-# ── Execution Worker Instance ──────────────────────────────────────────────────
-def execute_scraping_worker(year: Optional[int], month: Optional[int]):
-    global scraper_running_status, scraper_execution_result
-    try:
-        default_year, default_month = get_target_month()
-        year = year if year else default_year
-        month = month if month else default_month
-        
-        log.info(f"🚀 Execution launched — target: {year}-{month:02d} (Ultimate Mode)")
-        
-        current_dir = Path(os.getcwd())
-        tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
-        tmp_dir.mkdir(exist_ok=True)
-        
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-        
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
-            page, all_items = ctx.new_page(), {}
-            
-            for src in SOURCES:
-                log.info(f"📋 Scanning: {src['name']}")
-                empty_pages_streak = 0
-                
-                for page_num in range(1, MAX_SOURCE_PAGES + 1):
-                    page_url = src["url"] if page_num == 1 else f"{src['url'].rstrip('/')}/page/{page_num}"
-                    try: 
-                        page.goto(page_url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
-                    except Exception as e: 
-                        log.warning(f"  Page {page_num} load error: {e}. Skipping to next page.")
-                        continue 
-                    
-                    found = extract_article_links(page)
-                    if not found: 
-                        empty_pages_streak += 1
-                        log.info(f"  Page {page_num}: No links found.")
-                        if empty_pages_streak >= 3:
-                            log.info(f"  3 consecutive empty pages. Moving to next source.")
-                            break
-                        continue
-                    else:
-                        empty_pages_streak = 0
-
-                    added = 0
-                    for item in found:
-                        try: 
-                            ly, lm = int(item["date_str"][:4]), int(item["date_str"][5:7])
-                        except Exception: 
-                            continue
-                        
-                        if ly == year and lm == month and item["url"] not in all_items:
-                            all_items[item["url"]] = item
-                            added += 1
-
-                    log.info(f"  Page {page_num}: Found {len(found)} candidate links. Matched {year}-{month:02d}: {added}")
-            
-            sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
-            if not sorted_items:
-                scraper_execution_result = {"success": False, "filename": "", "message": f"No matching articles found for {year}-{month:02d}."}
-                browser.close()
-                return
-            
-            article_pdfs = []
-            for idx, item in enumerate(sorted_items, 1):
-                log.info(f"⚙ Processing ({idx}/{len(sorted_items)}) [{item['date_str']}] {item['text']}")
-                pdf = process_article(page, item, tmp_dir, tmp_dir, idx)
-                if pdf: article_pdfs.append(pdf)
-            browser.close()
-            
-        if not article_pdfs:
-            scraper_execution_result = {"success": False, "filename": "", "message": "No PDFs generated (Check if pages contain actual content)."}
-            return
-            
-        raw = tmp_dir / "raw_merged.pdf"
-        writer = PdfWriter()
-        for f in article_pdfs:
-            try: writer.append(str(f))
-            except Exception: pass
-        with raw.open("wb") as f: writer.write(f)
-        
-        final_filename = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
-        ensure_size_limit(raw, current_dir / final_filename)
-        scraper_execution_result = {"success": True, "filename": final_filename, "message": "Report generated successfully!"}
-        
-    except Exception as e:
-        scraper_execution_result = {"success": False, "filename": "", "message": str(e)}
-    finally:
-        scraper_running_status = False
-
-# ── Web Control Panel Embedded Portal (HTML Layout UI) ───────────────────────
-CONTROL_PANEL_UI_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8"><title>SMG Report Engine Portal</title>
-    <style>
-        body { font-family: sans-serif; background: #eef2f3; padding: 30px; }
-        .container { max-width: 900px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; }
-        input, select, button { padding: 10px; margin-bottom: 15px; width: 100%; box-sizing: border-box; }
-        button { background: #3498db; color: #fff; border: none; cursor: pointer; font-weight: bold; }
-        .console-box { background: #1e272e; color: #ced6e0; padding: 15px; height: 300px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; }
-        .status-banner { padding: 12px; background: #f1f2f6; font-weight: bold; margin-bottom: 20px; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h2>SMG Monthly PDF Scraper Console</h2>
-    <label>Target Year:</label> <input type="number" id="inputYear" placeholder="Leave blank for default (last month)">
-    <label>Target Month:</label> 
-    <select id="inputMonth">
-        <option value="">-- Default Last Month --</option>
-        <option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option>
-        <option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option>
-        <option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
-    </select>
-    <button id="btnAction" onclick="triggerTask()">Launch Scraper Engine (Ultimate)</button>
-    <div id="statusBanner" class="status-banner">System Engine Status: Idle</div>
-    <div id="downloadSection" style="display: none; padding:15px; background:#e8f4fd; margin-bottom:15px;">
-        <a id="linkDownload" href="#" style="background:#2ed573; color:#fff; padding:10px; text-decoration:none;">Download PDF Report</a>
-    </div>
-    <div id="consoleLog" class="console-box">Waiting for process invocation...</div>
-</div>
-<script>
-    let offset = 0, interval = null;
-    function checkStatus() {
-        fetch('/engine-status').then(r=>r.json()).then(d=>{
-            document.getElementById('statusBanner').innerText = d.running ? "Status: Running..." : "Status: " + d.result.message;
-            document.getElementById('btnAction').disabled = d.running;
-            if(!d.running && d.result.filename) {
-                document.getElementById('downloadSection').style.display = 'block';
-                document.getElementById('linkDownload').href = "/retrieve-file?file=" + encodeURIComponent(d.result.filename);
-                clearInterval(interval);
-            }
-        });
-    }
-    function fetchLogs() {
-        fetch('/poll-logs?offset='+offset).then(r=>r.json()).then(d=>{
-            if(d.logs.length) {
-                const c = document.getElementById('consoleLog');
-                d.logs.forEach(m => c.innerText += m + "\\n");
-                offset += d.logs.length;
-                c.scrollTop = c.scrollHeight;
-            }
-        });
-    }
-    function triggerTask() {
-        offset = 0; document.getElementById('consoleLog').innerText = "";
-        document.getElementById('downloadSection').style.display = 'none';
-        fetch('/trigger-execution', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({year: document.getElementById('inputYear').value, month: document.getElementById('inputMonth').value})
-        }).then(()=>{ clearInterval(interval); interval = setInterval(()=>{checkStatus(); fetchLogs();}, 1500); });
-    }
-    checkStatus();
-</script>
-</body>
-</html>
-"""
-
-app = Flask(__name__)
-@app.route('/')
-def serve_index_portal(): return render_template_string(CONTROL_PANEL_UI_TEMPLATE)
-@app.route('/trigger-execution', methods=['POST'])
-def trigger_execution_endpoint():
-    global scraper_running_status, scraper_execution_result, app_log_buffer
-    if scraper_running_status: return jsonify({"status": "rejected"}), 400
-    p = request.json or {}
-    app_log_buffer.clear()
-    scraper_execution_result = {"success": False, "filename": "", "message": "Started"}
-    scraper_running_status = True
-    threading.Thread(target=execute_scraping_worker, args=(int(p.get('year')) if p.get('year') else None, int(p.get('month')) if p.get('month') else None)).start()
-    return jsonify({"status": "initiated"})
-@app.route('/engine-status')
-def get_engine_status_endpoint(): return jsonify({"running": scraper_running_status, "result": scraper_execution_result})
-@app.route('/poll-logs')
-def poll_logs_endpoint(): return jsonify({"logs": app_log_buffer[request.args.get('offset', 0, type=int):]})
-@app.route('/retrieve-file')
-def retrieve_file_endpoint(): 
-    file_path = Path(os.getcwd()) / request.args.get('file', '')
-    return send_file(file_path, as_attachment=True)
-
-if __name__ == "__main__":
-    print("Starting server and opening browser...")
-    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
