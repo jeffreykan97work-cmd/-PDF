@@ -12,7 +12,6 @@ import webbrowser
 from datetime import date
 from pathlib import Path
 from typing import Optional
-import requests
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 from playwright.sync_api import Browser, Page, sync_playwright, TimeoutError as PWTimeout
 from pypdf import PdfReader, PdfWriter
@@ -52,11 +51,10 @@ SOURCES: list[dict] = [
     {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
 ]
 LANG_CODES = ["zh", "en", "pt"]
-MAX_FINAL_BYTES = 10 * 1024 * 1024 # 放寬到 10MB，確保全部資料裝得落
+MAX_FINAL_BYTES = 10 * 1024 * 1024
 
-# 【終極暴力設定】
-MAX_SOURCE_PAGES = 80       # 掃描深度加大到 80 頁，確保搵勻全網
-REQUEST_TIMEOUT = 90_000    # 放寬超時限制至 90 秒
+MAX_SOURCE_PAGES = 80       # 終極掃描深度
+REQUEST_TIMEOUT = 90_000    # 放寬超時限制
 
 PDF_LINK_SELECTORS = ["a[href$='.pdf']", "a[href*='.pdf?']", "a[href*='/pdf/']", "a[href*='download']", "a[href*='attach']", "a[href*='file']"]
 NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "page not found"]
@@ -101,29 +99,29 @@ def resolve_url(href: str) -> str:
     return href if href.startswith("http") else BASE_URL + href if href.startswith("/") else BASE_URL + "/" + href
 
 # ── Core Downloader Routines ────────────────────────────────────
-def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
+def download_pdf(url: str, dest: Path, page: Page) -> bool:
+    """使用 Playwright 的 Browser Context 進行下載，確保攜帶所有 Cookie"""
     try:
-        r = session.get(url, timeout=45, stream=True)
-        r.raise_for_status()
-        chunks = []
-        first = True
-        for chunk in r.iter_content(65536):
-            if first:
-                if not chunk.startswith(b"%PDF") and "pdf" not in r.headers.get("content-type", "") and not url.lower().endswith(".pdf"):
-                    return False
-                first = False
-            chunks.append(chunk)
-        dest.write_bytes(b"".join(chunks))
+        r = page.context.request.get(url, timeout=60000)
+        if not r.ok:
+            log.warning(f"    [WARNING] Download rejected by server: {url}")
+            return False
+        
+        content = r.body()
+        # 簡單校驗是否為 PDF 檔案內容，或者至少不是空檔
+        if not content.startswith(b"%PDF") and b"pdf" not in r.headers.get("content-type", "").lower() and not url.lower().endswith(".pdf"):
+            return False
+            
+        dest.write_bytes(content)
         return dest.stat().st_size > 2000
     except Exception as exc:
-        log.debug(f"    Download failed: {exc}")
+        log.warning(f"    [WARNING] Download failed for {url[:80]}: {exc}")
         dest.unlink(missing_ok=True)
         return False
 
 def extract_article_links(page: Page) -> list[dict]:
     results, seen_urls = [], set()
     
-    # 暴力強制等待渲染，並模擬人類滾動頁面 (觸發 Lazy Loading)
     page.wait_for_timeout(3000)
     page.evaluate("""() => {
         window.scrollTo(0, document.body.scrollHeight / 2);
@@ -134,8 +132,6 @@ def extract_article_links(page: Page) -> list[dict]:
     items_data = page.evaluate("""() => {
         const DATE_RE = /(20\\d{2})[\\s\\-\\/年\\.]+(\\d{1,2})[\\s\\-\\/月\\.]+(\\d{1,2})/;
         const results = [];
-        
-        // 捕獲包含隱藏數據的連結
         const links = Array.from(document.querySelectorAll('a, [onclick], [data-href], [data-url]'));
         
         links.forEach(el => {
@@ -150,7 +146,6 @@ def extract_article_links(page: Page) -> list[dict]:
             let dateStr = null;
             let title = (el.innerText || '').trim();
             
-            // 往上尋找 15 層，包攬任何排版結構
             for (let i = 0; i < 15; i++) {
                 if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
                 
@@ -159,7 +154,6 @@ def extract_article_links(page: Page) -> list[dict]:
                 
                 if (match) {
                     dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-' + match[3].padStart(2,'0');
-                    
                     if (title.length < 4 || /閱讀|詳情|more|detail/i.test(title)) {
                         const heading = node.querySelector('h1, h2, h3, h4, .title, .subject, strong');
                         if (heading) {
@@ -180,7 +174,6 @@ def extract_article_links(page: Page) -> list[dict]:
                 results.push({ href: href, date_str: dateStr, text: title.substring(0, 150) });
             }
         });
-        
         return results;
     }""")
 
@@ -191,8 +184,6 @@ def extract_article_links(page: Page) -> list[dict]:
         if any(x in hl for x in ['facebook.com', 'twitter.com', 'youtube.com', 'instagram.com']): continue
         
         full_url = resolve_url(href)
-        
-        # 網址去重
         norm_url = full_url
         for lang in LANG_CODES: norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
         if norm_url in seen_urls: continue
@@ -233,14 +224,14 @@ def find_pdf_links_on_page(page: Page) -> list[str]:
             found.append(u)
     return found
 
-def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: int, session: requests.Session) -> Optional[Path]:
+def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: int) -> Optional[Path]:
     collected, final_title = [], item["text"] or "Untitled"
     lang_pdf_map = {lang: [] for lang in LANG_CODES}
     
     for lang in LANG_CODES:
         try:
             page.goto(switch_lang(item["url"], lang), wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
-            page.wait_for_timeout(3000) # 給予內頁充分渲染時間
+            page.wait_for_timeout(3000)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(2000)
             
@@ -260,7 +251,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
                 seen_pdf_urls.add(url)
                 dest = tmp_dir / f"{seq:03d}_{lang}_{len(collected)}.pdf"
                 log.info(f"    Downloading [{lang}]: {url[:80]}")
-                if download_pdf(url, dest, session): collected.append((dest, LANG_CODES.index(lang)))
+                if download_pdf(url, dest, page): collected.append((dest, LANG_CODES.index(lang)))
 
     if not collected:
         log.info(f"    No PDFs found — falling back to print-to-PDF")
@@ -320,19 +311,17 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
         year = year if year else default_year
         month = month if month else default_month
         
-        log.info(f"🚀 Execution launched — target: {year}-{month:02d}")
+        log.info(f"🚀 Execution launched — target: {year}-{month:02d} (Ultimate Mode)")
         
         current_dir = Path(os.getcwd())
         tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
         tmp_dir.mkdir(exist_ok=True)
         
-        session = requests.Session()
-        session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
         
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            # 使用全螢幕解像度，防止 Responsive Design 將網址收入 Menu
-            ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=session.headers["User-Agent"])
+            ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             page, all_items = ctx.new_page(), {}
             
             for src in SOURCES:
@@ -342,11 +331,10 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                 for page_num in range(1, MAX_SOURCE_PAGES + 1):
                     page_url = src["url"] if page_num == 1 else f"{src['url'].rstrip('/')}/page/{page_num}"
                     try: 
-                        # 改為 domcontentloaded 防止 networkidle 卡死，並配合下方的強制 sleep
                         page.goto(page_url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
                     except Exception as e: 
                         log.warning(f"  Page {page_num} load error: {e}. Skipping to next page.")
-                        continue # 【關鍵修復】Timeout 唔好 break，繼續試下一頁
+                        continue 
                     
                     found = extract_article_links(page)
                     if not found: 
@@ -354,7 +342,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                         log.info(f"  Page {page_num}: No links found.")
                         if empty_pages_streak >= 3:
                             log.info(f"  3 consecutive empty pages. Moving to next source.")
-                            break # 連續 3 頁冇嘢先當作到底
+                            break
                         continue
                     else:
                         empty_pages_streak = 0
@@ -370,7 +358,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                             all_items[item["url"]] = item
                             added += 1
 
-                    log.info(f"  Page {page_num}: Found {len(found)} links. Matched {year}-{month:02d}: {added}")
+                    log.info(f"  Page {page_num}: Found {len(found)} candidate links. Matched {year}-{month:02d}: {added}")
             
             sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
             if not sorted_items:
@@ -381,7 +369,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             article_pdfs = []
             for idx, item in enumerate(sorted_items, 1):
                 log.info(f"⚙ Processing ({idx}/{len(sorted_items)}) [{item['date_str']}] {item['text']}")
-                pdf = process_article(page, item, tmp_dir, tmp_dir, idx, session)
+                pdf = process_article(page, item, tmp_dir, tmp_dir, idx)
                 if pdf: article_pdfs.append(pdf)
             browser.close()
             
@@ -431,7 +419,7 @@ CONTROL_PANEL_UI_TEMPLATE = """
         <option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option>
         <option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
     </select>
-    <button id="btnAction" onclick="triggerTask()">Launch Scraper Engine</button>
+    <button id="btnAction" onclick="triggerTask()">Launch Scraper Engine (Ultimate)</button>
     <div id="statusBanner" class="status-banner">System Engine Status: Idle</div>
     <div id="downloadSection" style="display: none; padding:15px; background:#e8f4fd; margin-bottom:15px;">
         <a id="linkDownload" href="#" style="background:#2ed573; color:#fff; padding:10px; text-decoration:none;">Download PDF Report</a>
