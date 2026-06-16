@@ -121,12 +121,9 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
 
 def extract_article_links(page: Page) -> list[dict]:
     """
-    Date extraction strategy (v3 — article-count guard):
-    Walk UP the DOM from each anchor. At every level that contains a date, also
-    count how many article links (our selector) live inside that node.
-    If count == 1 → this node is the per-article row/card; date is correct.
-    If count  > 1 → shared container; keep climbing to find exclusive node.
-    Fixes: shared <ul> returning the first article's date for ALL articles.
+    v4: language-aware unique-article guard.
+    SMG shows zh/en/pt links per article; strip lang prefix before counting
+    unique articles per container, so 3 language links → 1 unique article → accepted.
     """
     results, seen_urls = [], set()
     for el in page.query_selector_all(ARTICLE_LINK_SELECTOR):
@@ -134,12 +131,25 @@ def extract_article_links(page: Page) -> list[dict]:
             href = el.get_attribute("href") or ""
             if not href or "page/" in href: continue
             full_url = resolve_url(href)
-            if full_url in seen_urls: continue
+            norm_url = full_url
+            for lang in LANG_CODES:
+                norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
+            if norm_url in seen_urls: continue
+
             title = (el.evaluate("node => node.querySelector('.title, .subject, h3, h4, h2')?.innerText || node.innerText") or "").split("\n")[0].strip()
 
             date_str = el.evaluate("""el => {
                 const DATE_RE = /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/;
-                const ART_SEL = "a[href*='-detail'], a[href*='chat-info/']";
+                const ART_SEL = "a[href*=\'-detail\'], a[href*=\'chat-info/\']";
+                function normHref(href) { return href.replace(/\/(zh|en|pt)\//, '/'); }
+                function uniqueArticleCount(node) {
+                    const paths = new Set();
+                    node.querySelectorAll(ART_SEL).forEach(a => {
+                        const h = a.getAttribute('href') || '';
+                        if (h) paths.add(normHref(h));
+                    });
+                    return paths.size;
+                }
                 let node = el;
                 for (let i = 0; i < 12; i++) {
                     node = node.parentElement;
@@ -147,20 +157,19 @@ def extract_article_links(page: Page) -> list[dict]:
                     const text = node.innerText || '';
                     const m = text.match(DATE_RE);
                     if (!m) continue;
-                    const artCount = node.querySelectorAll(ART_SEL).length;
-                    if (artCount <= 1) {
-                        const y  = m[1].padStart(4, '0');
-                        const mo = m[2].padStart(2, '0');
-                        const d  = m[3].padStart(2, '0');
-                        return y + '-' + mo + '-' + d;
+                    if (uniqueArticleCount(node) <= 1) {
+                        return m[1].padStart(4,'0')+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');
                     }
                 }
                 return null;
             }""")
 
             if not date_str: continue
-            seen_urls.add(full_url)
-            results.append({"url": full_url, "text": title, "date_str": date_str})
+            seen_urls.add(norm_url)
+            zh_url = full_url
+            for lang in LANG_CODES:
+                zh_url = zh_url.replace(f"/{lang}/", "/zh/", 1)
+            results.append({"url": zh_url, "text": title, "date_str": date_str})
         except Exception: continue
     return results
 
