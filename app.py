@@ -38,27 +38,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 log.addHandler(WebLogHandler())
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Configuration (精準鎖定 6 個網址) ──────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
 SOURCES: list[dict] = [
-    {"name": "subpage_73",      "url": f"{BASE_URL}/zh/subpage/73"},
-    {"name": "news",            "url": f"{BASE_URL}/zh/news"},
     {"name": "activity",        "url": f"{BASE_URL}/zh/activity"},
-    {"name": "subpage_124",     "url": f"{BASE_URL}/zh/subpage/124"},
-    {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
-    {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
+    {"name": "news",            "url": f"{BASE_URL}/zh/news"},
     {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
-    {"name": "special_weather", "url": f"{BASE_URL}/zh/subpage/730"}, # 基於你的發現新增的來源
     {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
+    {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
+    {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
 ]
 LANG_CODES = ["zh", "en", "pt"]
-MAX_FINAL_BYTES = 10 * 1024 * 1024
+MAX_FINAL_BYTES = 50 * 1024 * 1024  # 50MB 確保夠位
 
-MAX_SOURCE_PAGES = 80       # 終極掃描深度
-REQUEST_TIMEOUT = 90_000    # 放寬超時限制
+MAX_SOURCE_PAGES = 80       
+REQUEST_TIMEOUT = 90_000    
 
 PDF_LINK_SELECTORS = ["a[href$='.pdf']", "a[href*='.pdf?']", "a[href*='/pdf/']", "a[href*='download']", "a[href*='attach']", "a[href*='file']"]
-NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "page not found"]
 
 PRINT_CSS = """
 @media print {
@@ -77,11 +73,9 @@ WAIT_IMAGES_JS = """
 })
 """
 
-# ── State Control Variables ─────────────────────────
 scraper_running_status: bool = False
 scraper_execution_result: dict = {"success": False, "filename": "", "message": "Idle"}
 
-# ── Helper Utility Functions ──────────────────────────────────────────────────
 def get_target_month() -> tuple[int, int]:
     today = date.today()
     if today.month > 1: return today.year, today.month - 1
@@ -99,13 +93,10 @@ def switch_lang(url: str, target_lang: str) -> str:
 def resolve_url(href: str) -> str:
     return href if href.startswith("http") else BASE_URL + href if href.startswith("/") else BASE_URL + "/" + href
 
-# ── Core Downloader Routines ────────────────────────────────────
 def download_pdf(url: str, dest: Path, page: Page) -> bool:
-    """使用 Playwright 的 Browser Context 進行下載，確保攜帶所有 Cookie"""
     try:
         r = page.context.request.get(url, timeout=60000)
         if not r.ok:
-            log.warning(f"    [WARNING] Download rejected by server: {url}")
             return False
         
         content = r.body()
@@ -115,7 +106,6 @@ def download_pdf(url: str, dest: Path, page: Page) -> bool:
         dest.write_bytes(content)
         return dest.stat().st_size > 2000
     except Exception as exc:
-        log.warning(f"    [WARNING] Download failed for {url[:80]}: {exc}")
         dest.unlink(missing_ok=True)
         return False
 
@@ -130,11 +120,12 @@ def extract_article_links(page: Page) -> list[dict]:
     page.wait_for_timeout(3000)
     
     items_data = page.evaluate("""() => {
-        const DATE_RE = /(20\\d{2})[\\s\\-\\/年\\.]+(\\d{1,2})[\\s\\-\\/月\\.]+(\\d{1,2})/;
-        const results = [];
+        const DATE_RE_1 = /(20\\d{2})[\\s\\-\\/年\\.]+(\\d{1,2})[\\s\\-\\/月\\.]+(\\d{1,2})/;
+        const DATE_RE_2 = /(\\d{1,2})[\\s\\-\\/日\\.]+(\\d{1,2})[\\s\\-\\/月\\.]+(20\\d{2})/;
+        const DATE_RE_3 = /(20\\d{2})[\\s\\-\\/年\\.]+(\\d{1,2})/; 
         
-        // 【修復】擴增選擇器，強制包含 news-detail 及 subpage/730
-        const links = Array.from(document.querySelectorAll('a[href*="news-detail"], a[href*="subpage/730"], a, [onclick], [data-href], [data-url]'));
+        const results = [];
+        const links = Array.from(document.querySelectorAll('a[href], [onclick], [data-href], [data-url]'));
         
         links.forEach(el => {
             let href = el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('data-url');
@@ -148,7 +139,6 @@ def extract_article_links(page: Page) -> list[dict]:
             let dateStr = null;
             let title = (el.innerText || '').trim();
             
-            // 【修復】優先嘗試從 URL 提取日期
             const urlDateMatch = href.match(/(20\\d{2})[\\-\\/](\\d{1,2})[\\-\\/](\\d{1,2})/);
             if (urlDateMatch) {
                 dateStr = urlDateMatch[1] + '-' + urlDateMatch[2].padStart(2,'0') + '-' + urlDateMatch[3].padStart(2,'0');
@@ -159,11 +149,20 @@ def extract_article_links(page: Page) -> list[dict]:
                 
                 const text = (node.innerText || '').replace(/\\u200B/g, '').trim();
                 
-                // 如果 URL 沒有日期，從 DOM 文字中提取
                 if (!dateStr) {
-                    const match = text.match(DATE_RE);
+                    let match = text.match(DATE_RE_1);
                     if (match) {
                         dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-' + match[3].padStart(2,'0');
+                    } else {
+                        match = text.match(DATE_RE_2);
+                        if (match) {
+                            dateStr = match[3] + '-' + match[2].padStart(2,'0') + '-' + match[1].padStart(2,'0');
+                        } else {
+                            match = text.match(DATE_RE_3);
+                            if (match) {
+                                dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-01'; 
+                            }
+                        }
                     }
                 }
                 
@@ -173,7 +172,7 @@ def extract_article_links(page: Page) -> list[dict]:
                         if (heading) {
                             title = heading.innerText.trim();
                         } else {
-                            const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 3 && !l.match(DATE_RE));
+                            const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 3 && !l.match(DATE_RE_1) && !l.match(DATE_RE_2));
                             if (lines.length > 0) title = lines[0];
                         }
                     }
@@ -189,13 +188,23 @@ def extract_article_links(page: Page) -> list[dict]:
             }
         });
         
-        // 【關鍵修復】如果頁面是「即時天氣預報」或找不到列表，直接把整個頁面當作一篇文章抓取！
-        if (results.length === 0 || window.location.href.includes('Holiday_weather') || window.location.href.includes('subpage/730')) {
+        // Live 即時預報強制抓取邏輯
+        if (results.length === 0 || window.location.href.includes('Holiday_weather')) {
             const bodyText = document.body.innerText;
-            const m = bodyText.match(DATE_RE);
+            let m = bodyText.match(DATE_RE_1);
+            let dateStr = null;
             if (m) {
-                const dateStr = m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0');
+                dateStr = m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0');
+            } else {
+                m = bodyText.match(DATE_RE_2);
+                if (m) dateStr = m[3] + '-' + m[2].padStart(2,'0') + '-' + m[1].padStart(2,'0');
+            }
+            if (dateStr || window.location.href.includes('Holiday_weather')) {
                 const title = document.querySelector('h1, h2, .title')?.innerText || document.title;
+                if(!dateStr) {
+                    const d = new Date();
+                    dateStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+                }
                 results.push({ href: window.location.href, date_str: dateStr, text: "Live Bulletin: " + title.substring(0, 100) });
             }
         }
@@ -265,7 +274,6 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
                 h = page.evaluate("() => document.querySelector('h1, h2, .news-detail-title, .title')?.innerText || ''")
                 if h: final_title = h.strip()
             
-            if any(m in page.inner_text("body").lower() for m in NO_CONTENT_MARKERS): continue
             pdf_urls = find_pdf_links_on_page(page)
             if pdf_urls: lang_pdf_map[lang].extend(pdf_urls)
         except Exception as exc: log.warning(f"    [{lang}] Page load failed: {exc}")
@@ -302,7 +310,6 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
                     }, 150);
                 })""")
                 
-                if any(m in page.inner_text("body").lower() for m in NO_CONTENT_MARKERS): continue
                 page.evaluate(WAIT_IMAGES_JS)
                 page.evaluate("""() => { ['header','nav','footer','.site-header','.breadcrumb','.navbar'].forEach(s => document.querySelectorAll(s).forEach(el => el.remove())); }""")
                 page.add_style_tag(content=PRINT_CSS)
@@ -322,26 +329,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
     with article_pdf.open("wb") as f: writer.write(f)
     return article_pdf
 
-def compress_with_pypdf(src: Path, dst: Path) -> bool:
-    try:
-        writer = PdfWriter()
-        for page in PdfReader(str(src)).pages:
-            page.compress_content_streams()
-            writer.add_page(page)
-        writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
-        with dst.open("wb") as f: writer.write(f)
-        return dst.exists() and dst.stat().st_size > 1000
-    except Exception: return False
-
 def ensure_size_limit(src: Path, final_path: Path) -> Path:
-    if src.stat().st_size <= MAX_FINAL_BYTES:
-        shutil.copy(src, final_path)
-        return final_path
-    log.info("  Compressing oversized file...")
-    tmp_py = final_path.with_suffix(".py.pdf")
-    if compress_with_pypdf(src, tmp_py) and tmp_py.stat().st_size <= MAX_FINAL_BYTES:
-        shutil.move(str(tmp_py), final_path)
-        return final_path
     shutil.copy(src, final_path)
     return final_path
 
@@ -353,7 +341,8 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
         year = year if year else default_year
         month = month if month else default_month
         
-        log.info(f"🚀 Execution launched — target: {year}-{month:02d} (Ultimate Deep Link Mode)")
+        # 🔑 防呆標記！如果你見唔到 [SUPER-V6]，證明系統仲係用緊舊 code！
+        log.info(f"🚀 [SUPER-V6] Execution launched — target: {year}-{month:02d}")
         
         current_dir = Path(os.getcwd())
         tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
@@ -368,26 +357,21 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             
             for src in SOURCES:
                 log.info(f"📋 Scanning: {src['name']}")
-                empty_pages_streak = 0
                 
                 try: 
                     page.goto(src["url"], wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(4000)
                 except Exception as e: 
                     log.warning(f"  Failed to load category {src['name']}: {e}")
                     continue 
                 
+                empty_pages_streak = 0
                 for page_num in range(1, MAX_SOURCE_PAGES + 1):
                     found = extract_article_links(page)
                     
                     if not found: 
-                        empty_pages_streak += 1
-                        log.info(f"  Page {page_num}: No links found.")
-                        if empty_pages_streak >= 2:
-                            log.info(f"  Reached end of list for {src['name']}.")
-                            break
-                    else:
-                        empty_pages_streak = 0
+                        log.info(f"  Page {page_num}: No links found. Reached end of list for {src['name']}.")
+                        break
 
                     added = 0
                     for item in found:
@@ -396,34 +380,34 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                         except Exception: 
                             continue
                         
-                        if ly == year and lm == month and item["url"] not in all_items:
-                            all_items[item["url"]] = item
-                            added += 1
+                        is_live = "Live/" in item["text"]
+                        if (ly == year and lm == month) or is_live:
+                            if item["url"] not in all_items:
+                                all_items[item["url"]] = item
+                                added += 1
 
-                    log.info(f"  Page {page_num}: Found {len(found)} candidate links. Matched {year}-{month:02d}: {added}")
+                    log.info(f"  Page {page_num}: Processed {len(found)} links. Matched: {added}")
                     
+                    # 模擬點擊下一頁
                     try:
                         action = page.evaluate("""() => {
                             const links = Array.from(document.querySelectorAll('a, button, li, span'));
                             for (let el of links) {
                                 const t = (el.innerText || '').trim();
                                 const title = el.getAttribute('title') || '';
-                                const aria = el.getAttribute('aria-label') || '';
-                                const isNext = t === '下一頁' || t === '下一页' || t === 'Next' || t === '>' || t === '»' || title.includes('下一頁') || aria.includes('Next');
+                                const isNext = t === '下一頁' || t === '下一页' || t === 'Next' || t === '>' || t === '»' || title.includes('下一頁');
                                 
                                 if (isNext && el.offsetParent !== null) {
-                                    const disabled = el.disabled || el.classList.contains('disabled') || (el.parentElement && el.parentElement.classList.contains('disabled'));
+                                    const disabled = el.disabled || el.classList.contains('disabled');
                                     if (!disabled) {
-                                        el.click();
-                                        return 'clicked';
+                                        el.click(); return 'clicked';
                                     }
                                 }
                             }
                             for (let el of links) {
                                 const t = (el.innerText || '').trim();
                                 if ((t.includes('載入更多') || t.includes('加载更多') || t.includes('Load More')) && el.offsetParent !== null) {
-                                    el.click();
-                                    return 'clicked';
+                                    el.click(); return 'clicked';
                                 }
                             }
                             return null;
@@ -432,10 +416,16 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                         if action == 'clicked':
                             page.wait_for_timeout(4000) 
                         else:
-                            log.info(f"  No 'Next' button found. Moving to next category.")
-                            break
+                            if "?" not in src["url"] and "page" not in src["url"].lower():
+                                next_url = f"{src['url'].rstrip('/')}/page/{page_num + 1}"
+                                try:
+                                    page.goto(next_url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
+                                    page.wait_for_timeout(4000)
+                                except:
+                                    break
+                            else:
+                                break
                     except Exception as e:
-                        log.warning(f"  Pagination error: {e}")
                         break
             
             sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
@@ -467,4 +457,74 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
         scraper_execution_result = {"success": True, "filename": final_filename, "message": "Report generated successfully!"}
         
     except Exception as e:
-        scraper_execution_result = {"success
+        scraper_execution_result = {"success": False, "filename": "", "message": str(e)}
+    finally:
+        scraper_running_status = False
+
+CONTROL_PANEL_UI_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><title>SMG Report Engine Portal</title>
+    <style>
+        body { font-family: sans-serif; background: #eef2f3; padding: 30px; }
+        .container { max-width: 900px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; }
+        input, select, button { padding: 10px; margin-bottom: 15px; width: 100%; box-sizing: border-box; }
+        button { background: #3498db; color: #fff; border: none; cursor: pointer; font-weight: bold; }
+        .console-box { background: #1e272e; color: #ced6e0; padding: 15px; height: 300px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; }
+        .status-banner { padding: 12px; background: #f1f2f6; font-weight: bold; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>SMG Monthly PDF Scraper Console</h2>
+    <label>Target Year:</label> <input type="number" id="inputYear" placeholder="Leave blank for default (last month)">
+    <label>Target Month:</label> 
+    <select id="inputMonth">
+        <option value="">-- Default Last Month --</option>
+        <option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option>
+        <option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option>
+        <option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
+    </select>
+    <button id="btnAction" onclick="triggerTask()">Launch Scraper Engine (SUPER-V6)</button>
+    <div id="statusBanner" class="status-banner">System Engine Status: Idle</div>
+    <div id="downloadSection" style="display: none; padding:15px; background:#e8f4fd; margin-bottom:15px;">
+        <a id="linkDownload" href="#" style="background:#2ed573; color:#fff; padding:10px; text-decoration:none;">Download PDF Report</a>
+    </div>
+    <div id="consoleLog" class="console-box">Waiting for process invocation...</div>
+</div>
+<script>
+    let offset = 0, interval = null;
+    function checkStatus() {
+        fetch('/engine-status').then(r=>r.json()).then(d=>{
+            document.getElementById('statusBanner').innerText = d.running ? "Status: Running..." : "Status: " + d.result.message;
+            document.getElementById('btnAction').disabled = d.running;
+            if(!d.running && d.result.filename) {
+                document.getElementById('downloadSection').style.display = 'block';
+                document.getElementById('linkDownload').href = "/retrieve-file?file=" + encodeURIComponent(d.result.filename);
+                clearInterval(interval);
+            }
+        });
+    }
+    function fetchLogs() {
+        fetch('/poll-logs?offset='+offset).then(r=>r.json()).then(d=>{
+            if(d.logs.length) {
+                const c = document.getElementById('consoleLog');
+                d.logs.forEach(m => c.innerText += m + "\\n");
+                offset += d.logs.length;
+                c.scrollTop = c.scrollHeight;
+            }
+        });
+    }
+    function triggerTask() {
+        offset = 0; document.getElementById('consoleLog').innerText = "";
+        document.getElementById('downloadSection').style.display = 'none';
+        fetch('/trigger-execution', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({year: document.getElementById('inputYear').value, month: document.getElementById('inputMonth').value})
+        }).then(()=>{ clearInterval(interval); interval = setInterval(()=>{checkStatus(); fetchLogs();}, 1500); });
+    }
+    checkStatus();
+</script>
+</body>
+</html>
