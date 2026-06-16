@@ -52,12 +52,13 @@ SOURCES: list[dict] = [
     {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
 ]
 LANG_CODES = ["zh", "en", "pt"]
-MAX_FINAL_BYTES = 5 * 1024 * 1024
-MAX_SOURCE_PAGES = 5
-REQUEST_TIMEOUT = 30_000
+MAX_FINAL_BYTES = 10 * 1024 * 1024 # 放寬到 10MB，確保全部資料裝得落
+
+# 【終極暴力設定】
+MAX_SOURCE_PAGES = 80       # 掃描深度加大到 80 頁，確保搵勻全網
+REQUEST_TIMEOUT = 90_000    # 放寬超時限制至 90 秒
 
 PDF_LINK_SELECTORS = ["a[href$='.pdf']", "a[href*='.pdf?']", "a[href*='/pdf/']", "a[href*='download']", "a[href*='attach']", "a[href*='file']"]
-# 移除了容易誤判的 "not found"
 NO_CONTENT_MARKERS = ["no related content", "nenhum conteúdo relacionado", "nenhum conteudo relacionado", "404", "page not found"]
 
 PRINT_CSS = """
@@ -102,7 +103,7 @@ def resolve_url(href: str) -> str:
 # ── Core Downloader Routines ────────────────────────────────────
 def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
     try:
-        r = session.get(url, timeout=30, stream=True)
+        r = session.get(url, timeout=45, stream=True)
         r.raise_for_status()
         chunks = []
         first = True
@@ -122,43 +123,48 @@ def download_pdf(url: str, dest: Path, session: requests.Session) -> bool:
 def extract_article_links(page: Page) -> list[dict]:
     results, seen_urls = [], set()
     
-    # 強制等待 Vue/React 動態渲染完成
-    page.wait_for_timeout(4000)
+    # 暴力強制等待渲染，並模擬人類滾動頁面 (觸發 Lazy Loading)
+    page.wait_for_timeout(3000)
+    page.evaluate("""() => {
+        window.scrollTo(0, document.body.scrollHeight / 2);
+        setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 1500);
+    }""")
+    page.wait_for_timeout(3000)
     
     items_data = page.evaluate("""() => {
-        const DATE_RE = /(20\\d{2})[-\\/年\\s]+(\\d{1,2})[-\\/月\\s]+(\\d{1,2})/;
+        const DATE_RE = /(20\\d{2})[\\s\\-\\/年\\.]+(\\d{1,2})[\\s\\-\\/月\\.]+(\\d{1,2})/;
         const results = [];
         
-        // 貪婪模式：獲取所有帶有超連結的元素
-        const links = Array.from(document.querySelectorAll('a, div[onclick]'));
+        // 捕獲包含隱藏數據的連結
+        const links = Array.from(document.querySelectorAll('a, [onclick], [data-href], [data-url]'));
         
         links.forEach(el => {
-            let href = el.getAttribute('href');
+            let href = el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('data-url');
             if (!href && el.getAttribute('onclick')) {
                 const m = el.getAttribute('onclick').match(/['"](.*?)['"]/);
                 if (m) href = m[1];
             }
-            if (!href || href === '#' || href.includes('javascript:')) return;
+            if (!href || href === '#' || href.toLowerCase().includes('javascript:')) return;
             
-            // 從超連結開始往上層找，找出包含這個超連結的卡片有沒有寫日期
             let node = el;
             let dateStr = null;
             let title = (el.innerText || '').trim();
             
-            for (let i = 0; i < 12; i++) {
+            // 往上尋找 15 層，包攬任何排版結構
+            for (let i = 0; i < 15; i++) {
                 if (!node || node.tagName === 'BODY' || node.tagName === 'HTML') break;
-                const text = node.innerText || '';
+                
+                const text = (node.innerText || '').replace(/\\u200B/g, '').trim();
                 const match = text.match(DATE_RE);
+                
                 if (match) {
                     dateStr = match[1] + '-' + match[2].padStart(2,'0') + '-' + match[3].padStart(2,'0');
                     
-                    // 如果這個連結本身只是按鈕 ("閱讀更多") 或圖片 (沒文字)，則從容器抓取正確的標題
-                    if (title.length < 4 || title.includes('閱讀更多') || title.includes('詳情')) {
-                        const heading = node.querySelector('h1, h2, h3, h4, .title, .subject');
+                    if (title.length < 4 || /閱讀|詳情|more|detail/i.test(title)) {
+                        const heading = node.querySelector('h1, h2, h3, h4, .title, .subject, strong');
                         if (heading) {
                             title = heading.innerText.trim();
                         } else {
-                            // 暴力拆解第一行非日期的文字作為標題
                             const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 3 && !l.match(DATE_RE));
                             if (lines.length > 0) title = lines[0];
                         }
@@ -169,7 +175,6 @@ def extract_article_links(page: Page) -> list[dict]:
             }
             
             if (dateStr) {
-                // 排除明顯無關的分頁連結
                 const hl = href.toLowerCase();
                 if (hl.includes('/page/') || hl.includes('?page=')) return;
                 results.push({ href: href, date_str: dateStr, text: title.substring(0, 150) });
@@ -187,7 +192,7 @@ def extract_article_links(page: Page) -> list[dict]:
         
         full_url = resolve_url(href)
         
-        # URL 去重處理
+        # 網址去重
         norm_url = full_url
         for lang in LANG_CODES: norm_url = norm_url.replace(f"/{lang}/", "/zh/", 1)
         if norm_url in seen_urls: continue
@@ -234,8 +239,10 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
     
     for lang in LANG_CODES:
         try:
-            page.goto(switch_lang(item["url"], lang), wait_until="networkidle", timeout=REQUEST_TIMEOUT)
-            page.wait_for_timeout(2000) # 給予內頁渲染時間
+            page.goto(switch_lang(item["url"], lang), wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
+            page.wait_for_timeout(3000) # 給予內頁充分渲染時間
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
             
             if not final_title or len(final_title) < 3 or "閱讀" in final_title or "詳情" in final_title or final_title == "Article":
                 h = page.evaluate("() => document.querySelector('h1, h2, .news-detail-title, .title')?.innerText || ''")
@@ -260,8 +267,8 @@ def process_article(page: Page, item: dict, tmp_dir: Path, out_dir: Path, seq: i
         for lang in LANG_CODES:
             dest = tmp_dir / f"{seq:03d}_{lang}_print.pdf"
             try:
-                page.goto(switch_lang(item["url"], lang), wait_until="networkidle", timeout=REQUEST_TIMEOUT)
-                page.wait_for_timeout(2000)
+                page.goto(switch_lang(item["url"], lang), wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
+                page.wait_for_timeout(3000)
                 if any(m in page.inner_text("body").lower() for m in NO_CONTENT_MARKERS): continue
                 page.evaluate(WAIT_IMAGES_JS)
                 page.evaluate("""() => { ['header','nav','footer','.site-header','.breadcrumb','.navbar'].forEach(s => document.querySelectorAll(s).forEach(el => el.remove())); }""")
@@ -309,7 +316,10 @@ def ensure_size_limit(src: Path, final_path: Path) -> Path:
 def execute_scraping_worker(year: Optional[int], month: Optional[int]):
     global scraper_running_status, scraper_execution_result
     try:
-        if not year or not month: year, month = get_target_month()
+        default_year, default_month = get_target_month()
+        year = year if year else default_year
+        month = month if month else default_month
+        
         log.info(f"🚀 Execution launched — target: {year}-{month:02d}")
         
         current_dir = Path(os.getcwd())
@@ -321,24 +331,33 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
         
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": 1280, "height": 1600}, user_agent=session.headers["User-Agent"])
+            # 使用全螢幕解像度，防止 Responsive Design 將網址收入 Menu
+            ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=session.headers["User-Agent"])
             page, all_items = ctx.new_page(), {}
             
             for src in SOURCES:
                 log.info(f"📋 Scanning: {src['name']}")
+                empty_pages_streak = 0
+                
                 for page_num in range(1, MAX_SOURCE_PAGES + 1):
-                    # 判斷是否需要附加分頁參數
                     page_url = src["url"] if page_num == 1 else f"{src['url'].rstrip('/')}/page/{page_num}"
                     try: 
-                        page.goto(page_url, wait_until="networkidle", timeout=REQUEST_TIMEOUT)
+                        # 改為 domcontentloaded 防止 networkidle 卡死，並配合下方的強制 sleep
+                        page.goto(page_url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
                     except Exception as e: 
-                        log.warning(f"  Page {page_num} load error: {e}")
-                        break
+                        log.warning(f"  Page {page_num} load error: {e}. Skipping to next page.")
+                        continue # 【關鍵修復】Timeout 唔好 break，繼續試下一頁
                     
                     found = extract_article_links(page)
                     if not found: 
-                        log.info(f"  Page {page_num}: No links found, moving to next source.")
-                        break
+                        empty_pages_streak += 1
+                        log.info(f"  Page {page_num}: No links found.")
+                        if empty_pages_streak >= 3:
+                            log.info(f"  3 consecutive empty pages. Moving to next source.")
+                            break # 連續 3 頁冇嘢先當作到底
+                        continue
+                    else:
+                        empty_pages_streak = 0
 
                     added = 0
                     for item in found:
@@ -351,9 +370,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                             all_items[item["url"]] = item
                             added += 1
 
-                    log.info(f"  Page {page_num}: Found {len(found)} candidate links. Matched {year}-{month:02d}: {added}")
-                    
-                    # 【重要修正】移除了原先會因為日期提早 break 的邏輯，強制跑滿 MAX_SOURCE_PAGES 或直到該頁面完全無數據為止
+                    log.info(f"  Page {page_num}: Found {len(found)} links. Matched {year}-{month:02d}: {added}")
             
             sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
             if not sorted_items:
