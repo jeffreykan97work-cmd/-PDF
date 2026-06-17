@@ -446,19 +446,15 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         # Scroll to load lazy content
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
-        # Optionally remove only ads or unimportant elements (keep header/nav for context)
-        # We'll remove only elements that are clearly not part of content
+        # Remove only non-essential elements
         page.evaluate("""() => {
-            // Remove only these if they exist and are not main content
             ['.cookie-bar', '.back-to-top', '.share-buttons']
             .forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
         }""")
-        # Ensure background color and images are printed
         page.add_style_tag(content=(
             "@media print{body{-webkit-print-color-adjust:exact !important;"
             "print-color-adjust:exact !important}}"
         ))
-        # Use scale 0.85 for a balance, keep background
         page.pdf(path=str(dest), format="A4", print_background=True, scale=0.85)
 
         if dest.exists() and dest.stat().st_size > 2_000:
@@ -517,7 +513,8 @@ def main(year: int, month: int) -> None:
                 except Exception as e:
                     log.warning(f"  Could not append {pdf_path.name}: {e}")
 
-        output = Path(f"SMG_News_Report_{year}_{month:02d}.pdf")  # 改名避免誤會
+        # 輸出檔案名稱改回原樣，與上傳步驟一致
+        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
             writer.write(fh)
 
