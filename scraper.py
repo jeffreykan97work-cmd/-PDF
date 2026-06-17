@@ -1,17 +1,16 @@
 from __future__ import annotations
 import argparse
-import json
 import logging
 import re
-import shutil
+import time
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from playwright.sync_api import Browser, Page, Response, sync_playwright
-from pypdf import PdfReader, PdfWriter
+from playwright.sync_api import Page, sync_playwright
+from pypdf import PdfWriter
 
-# ── Logging Setup ──────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -19,9 +18,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
-CMS_API  = "http://cms.smg.gov.mo"          # internal CMS API base
 
 SOURCES = [
     {"name": "news",            "url": f"{BASE_URL}/zh/news"},
@@ -32,33 +30,29 @@ SOURCES = [
     {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
 ]
 
-REQUEST_TIMEOUT   = 90_000      # ms
-SCROLL_PAUSE_MS   = 2_000       # ms between scrolls when loading more
-MAX_SCROLL_ROUNDS = 60          # safety cap on infinite-scroll attempts
+NAV_TIMEOUT   = 60_000   # ms — page navigation
+RENDER_WAIT   = 5_000    # ms — after navigation, wait for Vue to render data
+MAX_PAGES     = 50       # safety cap on pagination depth
 
-# ── BUG-FIX 1: Date regex — two-digit day/month alternatives reordered ────
-# Original:  (0?[1-9]|[12]\d|3[01])  → "0?" matches empty → "2" from "20" wins
-# Fixed:     ([12]\d|3[01]|0?[1-9])  → two-digit patterns tried first
-DATE_RE_PY = re.compile(
-    r"(20\d{2})"                      # year
+# ── BUG-FIX 1: Date regex ──────────────────────────────────────────────────
+# Original alternation (0?[1-9]|[12]\d|3[01]) matches only the first digit of
+# two-digit values like "20" because "0?" matches empty and "[1-9]" matches "2".
+# Fix: put two-digit alternatives FIRST so they are tried before single-digit.
+DATE_RE = re.compile(
+    r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
-    r"(1[0-2]|0?[1-9])"              # month  (1[0-2] before 0?[1-9])
+    r"(1[0-2]|0?[1-9])"           # month — two-digit first
     r"[\s\-\/月\.]+"
-    r"([12]\d|3[01]|0?[1-9])"        # day    (two-digit first)
+    r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
 )
 
-# Same fix for the JS regex injected into the browser.
-# NOTE: forward-slash does NOT need escaping inside JS /regex/ literals.
-# We define it as a normal string so Python doesn't misinterpret \s etc.
-# The string is spliced into a JS regex literal: /.../ via f-string.
-_JS_DATE_RE = "(20[0-9]{2})[\\s\\-/年.]+(1[0-2]|0?[1-9])[\\s\\-/月.]+([12][0-9]|3[01]|0?[1-9])"
+# JS version (injected into browser) — no Python escaping needed for /regex/
+_JS_DATE_RE = r"(20\d{{2}})[\s\-/年.]+(1[0-2]|0?[1-9])[\s\-/月.]+([12]\d|3[01]|0?[1-9])"
 
 
 def get_target_month() -> tuple[int, int]:
     today = date.today()
-    if today.month > 1:
-        return today.year, today.month - 1
-    return today.year - 1, 12
+    return (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
 
 
 def sanitize_filename(name: str, max_len: int = 100) -> str:
@@ -67,353 +61,262 @@ def sanitize_filename(name: str, max_len: int = 100) -> str:
 
 
 def parse_date_str(raw: str) -> Optional[str]:
-    """Return 'YYYY-MM-DD' or None."""
-    m = DATE_RE_PY.search(raw)
+    m = DATE_RE.search(raw)
     if not m:
         return None
     return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
 
 
-# ── BUG-FIX 2: Network interception replaces /page/N URL hacking ──────────
-# The SMG site is a Vue.js SPA; appending /page/2 to the URL just returns the
-# same page-1 HTML shell — pagination is driven by API calls.  We intercept
-# those XHR/fetch responses to collect article metadata without needing to
-# reverse-engineer the exact API path.
+# ── Core: extract article links from current page DOM ─────────────────────
+_EXTRACT_JS = """
+() => {
+    const DATE_RE = /(20\\d{2})[\\s\\-\\/年.]+(1[0-2]|0?[1-9])[\\s\\-\\/月.]+([12]\\d|3[01]|0?[1-9])/;
+    const found = [];
+    const seen  = new Set();
 
-def _intercept_articles_from_api(
-    responses: list[dict],
-    year: int,
-    month: int,
-    source_name: str,
-) -> tuple[dict[str, dict], bool]:
-    """
-    Parse intercepted API responses for article metadata.
-    Returns (new_items_dict, found_older) so the caller can decide whether
-    to stop scrolling.
-    """
-    new_items: dict[str, dict] = {}
-    found_older = False
+    function abs(href) {
+        if (!href) return null;
+        if (href.startsWith('http')) return href;
+        if (href.startsWith('/'))   return '""" + BASE_URL + """' + href;
+        return '""" + BASE_URL + """/' + href;
+    }
 
-    for resp_data in responses:
-        try:
-            payload = resp_data if isinstance(resp_data, dict) else {}
-            # Typical SMG CMS shapes: { data: [ {id, releaseDate, title, ...} ] }
-            # or  { content: [...] }  or  { list: [...] }
-            for key in ("data", "content", "list", "items", "posts", "results"):
-                if key in payload and isinstance(payload[key], list):
-                    for art in payload[key]:
-                        url, date_str, title = _extract_article_meta(art)
-                        if not url or not date_str:
-                            continue
-                        ly, lm = int(date_str[:4]), int(date_str[5:7])
-                        if (ly, lm) < (year, month):
-                            found_older = True
-                        elif (ly, lm) == (year, month):
-                            if url not in new_items:
-                                new_items[url] = {
-                                    "url": url,
-                                    "date_str": date_str,
-                                    "text": title,
-                                    "source": source_name,
-                                }
-        except Exception:
-            pass
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while (node = walker.nextNode()) {
+        const text  = node.nodeValue.trim();
+        const match = text.match(DATE_RE);
+        if (!match) continue;
 
-    return new_items, found_older
+        // BUG-FIX: corrected group order — two-digit day captured properly
+        const dateStr = match[1] + '-'
+            + match[2].padStart(2, '0') + '-'
+            + match[3].padStart(2, '0');
+
+        let container = node.parentElement;
+        let links = [];
+        for (let i = 0; i < 8; i++) {
+            if (!container || container.tagName === 'BODY') break;
+            links = Array.from(container.querySelectorAll(
+                'a[href]:not([href="#"]):not([href^="javascript"]), [data-url], [onclick]'
+            ));
+            if (links.length > 0 && links.length <= 20) break;
+            container = container.parentElement;
+        }
+
+        links.forEach(el => {
+            let href = el.getAttribute('href') || el.getAttribute('data-url');
+            if (!href) {
+                const oc = el.getAttribute('onclick') || '';
+                const m2 = oc.match(/['"](\\/[^'"]+)['"]/);
+                if (m2) href = m2[1];
+            }
+            // Skip pagination links themselves
+            if (!href || /\\/page\\/\\d+/.test(href) || href.includes('?page=')) return;
+
+            const url = abs(href);
+            if (!url || seen.has(url)) return;
+            seen.add(url);
+
+            let title = (el.innerText || '').trim();
+            if (title.length < 3 && container)
+                title = (container.innerText || '').split('\\n')[0].trim();
+
+            found.push({ url, date_str: dateStr, text: title.substring(0, 80) });
+        });
+    }
+
+    // Holiday_weather: page itself is the article
+    if (found.length === 0 && window.location.href.includes('Holiday_weather')) {
+        const m = document.body.innerText.match(DATE_RE);
+        if (m) found.push({
+            url:      window.location.href,
+            date_str: m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0'),
+            text:     document.title,
+        });
+    }
+    return found;
+}
+"""
+
+# ── Pagination: find max page number from rendered DOM ────────────────────
+_PAGINATION_JS = """
+() => {
+    // Look for <a href="/zh/.../page/N"> links
+    const links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
+    let maxPage = 1;
+    links.forEach(a => {
+        const m = a.href.match(/\\/page\\/(\\d+)/);
+        if (m) maxPage = Math.max(maxPage, parseInt(m[1], 10));
+    });
+
+    // Also check text like "共 N 頁" / "Page N of M"
+    const bodyText = document.body.innerText;
+    const m2 = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+pages?/i);
+    if (m2) maxPage = Math.max(maxPage, parseInt(m2[1], 10));
+
+    return maxPage;
+}
+"""
 
 
-def _extract_article_meta(art: dict) -> tuple[Optional[str], Optional[str], str]:
-    """Try common CMS field names to get (url, date_str, title)."""
-    # URL
-    url = None
-    for f in ("url", "link", "href", "detailUrl", "path"):
-        if f in art and isinstance(art[f], str) and art[f]:
-            raw = art[f]
-            url = raw if raw.startswith("http") else BASE_URL + raw
-            break
-    # ID-based fallback
-    if not url:
-        for id_f in ("id", "postId", "articleId"):
-            if id_f in art and art[id_f]:
-                url = f"{BASE_URL}/zh/news-detail/{art[id_f]}"
-                break
-
-    # Date
-    date_str = None
-    for f in ("releaseDate", "publishDate", "date", "createAt", "updateAt", "pubDate"):
-        if f in art and isinstance(art[f], str):
-            date_str = parse_date_str(art[f])
-            if date_str:
-                break
-
-    # Title
-    title = ""
-    for f in ("title", "name", "subject", "heading"):
-        val = art.get(f)
-        if isinstance(val, dict):                     # {zh_TW: "...", zh_CN: "..."}
-            val = val.get("zh_TW") or val.get("zh") or next(iter(val.values()), "")
-        if isinstance(val, str) and val.strip():
-            title = val.strip()
-            break
-
-    return url, date_str, title
+def navigate_and_wait(page: Page, url: str) -> bool:
+    """Navigate to url, wait for Vue to render. Returns True on success."""
+    try:
+        # BUG-FIX 2 (key): use "networkidle" so Vue has time to fetch & render
+        # its article list before we try to read the DOM.
+        page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT)
+        page.wait_for_timeout(RENDER_WAIT)
+        return True
+    except Exception as e:
+        log.warning(f"  Navigation failed ({url}): {e}")
+        return False
 
 
-def collect_articles_for_source(
+def extract_page_articles(page: Page) -> list[dict]:
+    try:
+        return page.evaluate(_EXTRACT_JS) or []
+    except Exception as e:
+        log.warning(f"  DOM extraction failed: {e}")
+        return []
+
+
+def get_max_page(page: Page) -> int:
+    try:
+        return max(1, int(page.evaluate(_PAGINATION_JS)))
+    except Exception:
+        return 1
+
+
+def collect_source(
     page: Page,
     src: dict,
     year: int,
     month: int,
 ) -> dict[str, dict]:
     """
-    Navigate to a source listing, intercept API responses while scrolling,
-    and fall back to DOM scraping when no API traffic is found.
+    Scan one source section across all its listing pages.
+
+    BUG-FIX 2 (full):  The original code used /page/N URL injection on a SPA
+    whose Vue router hadn't mounted yet → identical page content → one-page loop.
+    Fix: load page 1 first with networkidle wait (Vue mounts & renders listing),
+    then read the actual pagination links from the DOM to get the real page count,
+    then navigate each page URL in sequence.  The Vue router IS already initialised
+    from page 1 so /page/N navigations work correctly.
     """
-    intercepted_raw: list[dict] = []
+    all_items: dict[str, dict] = {}
+    base_url = src["url"].rstrip("/")
+    source_name = src["name"]
 
-    def _on_response(resp: Response) -> None:
-        try:
-            ct = resp.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            url = resp.url
-            # Only care about CMS / news-related API calls
-            if not any(kw in url for kw in ("api", "news", "post", "article", "list")):
-                return
-            body = resp.json()
-            if isinstance(body, (dict, list)):
-                intercepted_raw.append(body if isinstance(body, dict) else {"data": body})
-        except Exception:
-            pass
-
-    page.on("response", _on_response)
-
-    log.info(f"  Loading: {src['url']}")
-    try:
-        page.goto(src["url"], wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
-        page.wait_for_timeout(3_000)
-    except Exception as e:
-        log.warning(f"  Failed initial load of {src['url']}: {e}")
-        page.remove_listener("response", _on_response)
+    log.info(f"  Loading page 1: {base_url}")
+    if not navigate_and_wait(page, base_url):
         return {}
 
-    all_items: dict[str, dict] = {}
+    # Read total pages from rendered DOM (only available after Vue mounts)
+    max_page = get_max_page(page)
+    log.info(f"  Detected {max_page} listing page(s)")
 
-    # ── Strategy A: Scroll to trigger pagination API calls ─────────────────
-    # BUG-FIX 2 core: instead of navigating to /page/N (which doesn't work on
-    # the SPA), we scroll to the bottom repeatedly so the Vue component fires
-    # its own "load more" requests, which we intercept.
-    for scroll_round in range(MAX_SCROLL_ROUNDS):
-        snap = len(intercepted_raw)
+    for page_num in range(1, max_page + 1):
+        if page_num > 1:
+            page_url = f"{base_url}/page/{page_num}"
+            log.info(f"  Loading page {page_num}: {page_url}")
+            if not navigate_and_wait(page, page_url):
+                break
 
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(SCROLL_PAUSE_MS)
+            # Detect SPA redirect-to-page-1 (Vue ignores bad page numbers)
+            cur_url = page.url
+            if page_num > 1 and not f"/page/{page_num}" in cur_url:
+                log.info(f"  Redirected away from page {page_num} — stopping")
+                break
 
-        # Also try clicking any visible "下一頁 / 更多 / load-more" button
-        for selector in (
-            "button.load-more", "a.load-more", "[class*='more']",
-            "button:has-text('更多')", "button:has-text('下一頁')",
-            "a:has-text('更多')", "a:has-text('下一頁')",
-        ):
+        articles = extract_page_articles(page)
+        if not articles:
+            log.info(f"  Page {page_num}: no articles found — stopping")
+            break
+
+        added        = 0
+        found_older  = False
+
+        for item in articles:
+            ds = item.get("date_str", "")
+            if len(ds) < 10:
+                continue
             try:
-                btn = page.query_selector(selector)
-                if btn and btn.is_visible():
-                    btn.click()
-                    page.wait_for_timeout(SCROLL_PAUSE_MS)
-                    break
-            except Exception:
-                pass
+                ly, lm = int(ds[:4]), int(ds[5:7])
+            except ValueError:
+                continue
 
-        # Parse whatever new JSON arrived
-        new_batch = intercepted_raw[snap:]
-        if new_batch:
-            new_items, found_older = _intercept_articles_from_api(
-                new_batch, year, month, src["name"]
-            )
-            all_items.update(new_items)
-            log.info(
-                f"  scroll {scroll_round+1}: +{len(new_items)} matched "
-                f"({'older found – stop' if found_older else 'continue'})"
-            )
-            if found_older:
-                break
-        else:
-            # No new JSON and no change in page height → end of content
-            prev_height = page.evaluate("document.body.scrollHeight")
-            page.wait_for_timeout(500)
-            new_height = page.evaluate("document.body.scrollHeight")
-            if new_height == prev_height:
-                log.info(f"  No new content after scroll {scroll_round+1}. Done.")
-                break
+            if (ly, lm) < (year, month):
+                found_older = True
+            elif (ly, lm) == (year, month):
+                url = item["url"]
+                if url not in all_items:
+                    all_items[url] = {**item, "source": source_name}
+                    added += 1
 
-    # ── Strategy B: DOM fallback when no API traffic was intercepted ────────
-    if not all_items:
-        log.info(f"  No API traffic captured — falling back to DOM scraping")
-        dom_items = _extract_from_dom(page, year, month, src["name"])
-        all_items.update(dom_items)
+        log.info(
+            f"  Page {page_num}: {len(articles)} articles, "
+            f"+{added} matched {year}-{month:02d}"
+            + (" [older found → stop]" if found_older else "")
+        )
 
-    page.remove_listener("response", _on_response)
+        # BUG-FIX 4: only stop AFTER finishing the current page, not mid-page.
+        # (Original code set stop_pagination on first old article, but the flag
+        # only took effect on the NEXT source page, which was fine. Kept same.)
+        if found_older:
+            break
+
     return all_items
 
 
-def _extract_from_dom(
-    page: Page,
-    year: int,
-    month: int,
-    source_name: str,
-) -> dict[str, dict]:
-    """
-    Improved DOM-based link extraction.  Uses the fixed JS date regex and
-    handles Vue router-link elements and data-url attributes.
-    """
-    results = page.evaluate(f"""() => {{
-        const DATE_RE = /{_JS_DATE_RE}/;
-        const found = [];
-        const seen = new Set();
-
-        // Helper: build absolute URL
-        function abs(href) {{
-            if (!href) return null;
-            if (href.startsWith('http')) return href;
-            if (href.startsWith('/')) return '{BASE_URL}' + href;
-            return '{BASE_URL}/' + href;
-        }}
-
-        // Walk every text node looking for a date
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        let node;
-        while (node = walker.nextNode()) {{
-            const text = node.nodeValue.trim();
-            const match = text.match(DATE_RE);
-            if (!match) continue;
-
-            // FIX: use corrected group order for two-digit day
-            const dateStr = match[1] + '-'
-                + match[2].padStart(2, '0') + '-'
-                + match[3].padStart(2, '0');
-
-            // Walk up to 8 ancestors looking for links
-            let container = node.parentElement;
-            let links = [];
-            for (let i = 0; i < 8; i++) {{
-                if (!container || container.tagName === 'BODY') break;
-                // Standard <a href>, Vue router-link, [data-url], [onclick]
-                links = Array.from(container.querySelectorAll(
-                    'a[href]:not([href="#"]):not([href^="javascript"]), ' +
-                    'router-link[to], [data-url], [onclick]'
-                ));
-                if (links.length > 0 && links.length <= 20) break;
-                container = container.parentElement;
-            }}
-
-            links.forEach(el => {{
-                let href = el.getAttribute('href')
-                    || el.getAttribute('to')
-                    || el.getAttribute('data-url');
-                if (!href) {{
-                    const oc = el.getAttribute('onclick') || '';
-                    const m2 = oc.match(/['"]([/][^'"]+)['"]/);
-                    if (m2) href = m2[1];
-                }}
-                if (!href || href.includes('/page/') || href.includes('?page=')) return;
-
-                const url = abs(href);
-                if (!url || seen.has(url)) return;
-                seen.add(url);
-
-                // Title: prefer the container's first line of text
-                let title = (el.innerText || '').trim();
-                if (title.length < 3 && container) {{
-                    title = (container.innerText || '').split('\\n')[0].trim();
-                }}
-                found.push({{ url, date_str: dateStr, text: title.substring(0, 80) }});
-            }});
-        }}
-
-        // Holiday_weather special case: the page IS the article
-        if (found.length === 0 && window.location.href.includes('Holiday_weather')) {{
-            const bodyText = document.body.innerText;
-            const m = bodyText.match(DATE_RE);
-            if (m) {{
-                found.push({{
-                    url: window.location.href,
-                    date_str: m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0'),
-                    text: document.title,
-                }});
-            }}
-        }}
-        return found;
-    }}""")
-
-    items: dict[str, dict] = {}
-    for item in results:
-        ds = item.get("date_str", "")
-        if len(ds) < 10:
-            continue
-        try:
-            ly, lm = int(ds[:4]), int(ds[5:7])
-        except ValueError:
-            continue
-
-        # BUG-FIX 3: Holiday_weather no longer bypasses the date filter.
-        # They are included only if they fall in the target month.
-        if (ly, lm) == (year, month):
-            url = item["url"]
-            if url not in items:
-                items[url] = {**item, "source": source_name}
-
-    return items
-
+# ── Article rendering ──────────────────────────────────────────────────────
 
 def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
     try:
-        with page.context.expect_download(timeout=45_000) as dl_info:
+        with page.context.expect_download(timeout=45_000) as dl:
             page.evaluate(f"window.open('{url}', '_blank')")
-        dl_info.value.save_as(dest)
+        dl.value.save_as(dest)
         return dest.exists() and dest.stat().st_size > 2_000
     except Exception as e:
-        log.warning(f"  [PDF Download Failed] {url}: {e}")
+        log.warning(f"  PDF download failed ({url}): {e}")
         return False
 
 
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
-    safe_title = item["text"][:30].replace("/", "-")
-    name = f"{seq:03d}_{item['date_str']}_{safe_title}.pdf"
-    dest = tmp_dir / sanitize_filename(name)
+    safe = item["text"][:30].replace("/", "-")
+    dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['date_str']}_{safe}.pdf")
 
     try:
-        page.goto(item["url"], wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT)
+        page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2_000)
 
-        # Try embedded PDF download link first
+        # Try embedded PDF first
         pdf_links: list[str] = page.evaluate(
-            "() => Array.from(document.querySelectorAll('a[href$=\".pdf\"], a[href*=\"download\"]'))"
-            ".map(a => a.href)"
+            "() => Array.from(document.querySelectorAll('a[href$=\".pdf\"],a[href*=\"download\"]'))"
+            ".map(a=>a.href)"
         )
         if pdf_links and download_pdf_robust(pdf_links[0], dest, page):
             return dest
 
-        # Full-page screenshot → PDF
+        # Full-page print-to-PDF
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1_500)
-
-        # BUG-FIX 5: Only remove known chrome elements, not all .navbar
+        page.wait_for_timeout(1_000)
+        # BUG-FIX 5: remove only known chrome elements, not generic .navbar
         page.evaluate("""() => {
-            ['header', 'nav', 'footer', '.site-header', '.breadcrumb',
-             '#header', '#footer', '#nav', '.cookie-bar', '.back-to-top'
-            ].forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
+            ['header','nav','footer','#header','#footer','#nav',
+             '.site-header','.breadcrumb','.cookie-bar','.back-to-top',
+             '.navbar-top','.sticky-header']
+            .forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
         }""")
         page.add_style_tag(content=(
-            "@media print {"
-            "  body { -webkit-print-color-adjust: exact !important;"
-            "         print-color-adjust: exact !important; }"
-            "}"
+            "@media print{body{-webkit-print-color-adjust:exact !important;"
+            "print-color-adjust:exact !important}}"
         ))
         page.pdf(path=str(dest), format="A4", print_background=True)
 
         if dest.exists() and dest.stat().st_size > 2_000:
             return dest
-        log.warning(f"  Generated PDF too small, skipping: {dest.name}")
+        log.warning(f"  PDF too small, skipping: {dest.name}")
         return None
 
     except Exception as e:
@@ -421,14 +324,17 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         return None
 
 
+# ── Entry point ────────────────────────────────────────────────────────────
+
 def main(year: int, month: int) -> None:
-    log.info(f"🚀 SMG Scraper — Target: {year}-{month:02d}")
+    log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
+
     tmp_dir = Path(f"smg_tmp_{year}_{month:02d}")
     tmp_dir.mkdir(exist_ok=True)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(
+        ctx  = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             accept_downloads=True,
         )
@@ -437,51 +343,42 @@ def main(year: int, month: int) -> None:
         all_items: dict[str, dict] = {}
 
         for src in SOURCES:
-            log.info(f"📋 Scanning source: {src['name']}")
-            # BUG-FIX 2+4: Use scroll-interception instead of /page/N URL hacking.
-            # Each source is fully scrolled; early-stop is handled inside
-            # collect_articles_for_source via found_older flag, not at the per-link
-            # level (which was too aggressive).
-            src_items = collect_articles_for_source(page, src, year, month)
+            log.info(f"\n📋 Source: {src['name']}")
+            items = collect_source(page, src, year, month)
             before = len(all_items)
-            all_items.update(src_items)
-            log.info(f"  ✔ {src['name']}: {len(src_items)} articles "
-                     f"(+{len(all_items) - before} new unique)")
+            all_items.update(items)
+            log.info(f"  ✔ {src['name']}: {len(items)} found, "
+                     f"{len(all_items)-before} new unique")
 
         if not all_items:
-            log.warning(f"❌ No matching articles found for {year}-{month:02d}.")
+            log.warning(f"❌ No articles found for {year}-{month:02d}. Exiting.")
             browser.close()
             return
 
         sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
-        log.info(f"\n📦 Total unique articles: {len(sorted_items)}")
+        log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
 
         writer = PdfWriter()
-        for i, item in enumerate(sorted_items):
-            log.info(
-                f"\n⚙ ({i+1}/{len(sorted_items)}) "
-                f"[{item['date_str']}] {item['text'][:50]}"
-            )
-            p = process_article(page, item, tmp_dir, i)
-            if p:
+        for i, item in enumerate(sorted_items, 1):
+            log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
+            pdf_path = process_article(page, item, tmp_dir, i)
+            if pdf_path:
                 try:
-                    writer.append(str(p))
+                    writer.append(str(pdf_path))
                 except Exception as e:
-                    log.warning(f"  Could not append {p.name}: {e}")
+                    log.warning(f"  Could not append {pdf_path.name}: {e}")
 
-        output_file = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
-        with output_file.open("wb") as f:
-            writer.write(f)
+        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
+        with output.open("wb") as fh:
+            writer.write(fh)
 
-        size_mb = output_file.stat().st_size / 1_048_576
-        log.info(f"\n✅ Report generated: {output_file.name} ({size_mb:.2f} MB)")
+        mb = output.stat().st_size / 1_048_576
+        log.info(f"\n✅ Done: {output.name}  ({mb:.2f} MB)")
         browser.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate monthly PDF report from SMG website"
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("--year",  type=int, default=get_target_month()[0])
     parser.add_argument("--month", type=int, default=get_target_month()[1])
     args = parser.parse_args()
