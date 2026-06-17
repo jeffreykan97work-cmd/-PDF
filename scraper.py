@@ -24,14 +24,13 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://www.smg.gov.mo"
 MAX_PDF_SIZE = 5 * 1024 * 1024  # 5 MB
 
-# 您可以在此增減來源，只保留您需要的
 SOURCES = [
     {"name": "news",            "url": f"{BASE_URL}/zh/news"},
     {"name": "activity",        "url": f"{BASE_URL}/zh/activity"},
     {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
     {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
     {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
-    # {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},   # 可註解掉
+    # {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
 ]
 
 NAV_TIMEOUT   = 60_000   # ms
@@ -225,7 +224,6 @@ def get_current_page(page: Page) -> int:
 
 
 def click_next_page(page: Page) -> bool:
-    # 1. Explicit "next" button
     next_selectors = [
         "a:has-text('下一頁')", "a:has-text('下一页')",
         "a:has-text('Next')", "a:has-text('>')",
@@ -241,7 +239,6 @@ def click_next_page(page: Page) -> bool:
         except Exception:
             continue
 
-    # 2. Click specific page number (current + 1)
     current = get_current_page(page)
     target = current + 1
     try:
@@ -255,7 +252,6 @@ def click_next_page(page: Page) -> bool:
     except Exception:
         pass
 
-    # 3. Find smallest number > current in pagination container
     try:
         pagination = page.locator(".pagination, .pager, .page-nav, [class*='pagination'], [class*='pager']")
         if pagination.count():
@@ -290,7 +286,7 @@ def get_articles_hash(page: Page) -> str:
         return ""
 
 
-# ── Collect source (pagination via click) ─────────────────────────────────
+# ── Collect source ──────────────────────────────────────────────────────
 def collect_source(
     page: Page,
     src: dict,
@@ -380,24 +376,19 @@ def collect_source(
     return all_items
 
 
-# ── Article rendering (improved) ──────────────────────────────────────────
+# ── Article rendering ────────────────────────────────────────────────────
 def download_pdf_robust(page: Page, pdf_url: str, dest: Path) -> bool:
-    """
-    Attempt to download PDF by clicking a download button or navigating directly.
-    """
-    # Try clicking on any visible "下載PDF" or "Download" button
+    # 嘗試點擊「下載 PDF」按鈕
     download_btn_selectors = [
-        "a:has-text('下載PDF')",
-        "a:has-text('下載')",
-        "button:has-text('下載PDF')",
-        "button:has-text('下載')",
-        "a[href*='download']",
+        "a:has-text('下載PDF')", "a:has-text('下載')",
+        "button:has-text('下載PDF')", "button:has-text('下載')",
+        "a[href*='download']", "a[href$='.pdf']"
     ]
     for sel in download_btn_selectors:
         try:
             btn = page.locator(sel).first
             if btn.count() and btn.is_visible() and btn.is_enabled():
-                with page.expect_download(timeout=120_000) as download_info:
+                with page.expect_download(timeout=180_000) as download_info:
                     btn.click()
                 download = download_info.value
                 download.save_as(dest)
@@ -406,10 +397,10 @@ def download_pdf_robust(page: Page, pdf_url: str, dest: Path) -> bool:
         except Exception:
             continue
 
-    # Fallback: navigate directly to the URL
+    # 直接導航到 PDF 連結
     for attempt in range(2):
         try:
-            with page.expect_download(timeout=120_000) as download_info:
+            with page.expect_download(timeout=180_000) as download_info:
                 page.goto(pdf_url, wait_until="commit", timeout=30_000)
             download = download_info.value
             download.save_as(dest)
@@ -417,7 +408,7 @@ def download_pdf_robust(page: Page, pdf_url: str, dest: Path) -> bool:
                 return True
         except Exception as e:
             log.warning(f"  PDF download attempt {attempt+1} failed ({pdf_url}): {e}")
-            time.sleep(2)
+            time.sleep(3)
     return False
 
 
@@ -426,36 +417,80 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
     dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['full_date'].replace(':', '-')}_{safe}.pdf")
 
     try:
+        # 先載入文章頁
+        log.info(f"  Loading article: {item['url']}")
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(3_000)  # let any dynamic content load
+        page.wait_for_timeout(3_000)
 
-        # 1. Look for a PDF download link or button
+        # 嘗試下載 PDF
         pdf_links: list[str] = page.evaluate("""
             () => {
                 const links = Array.from(document.querySelectorAll('a[href$=".pdf"], a[href*="download-pdf"]'));
                 return links.map(a => a.href);
             }
         """)
+        downloaded = False
         if pdf_links:
             pdf_url = pdf_links[0]
-            if download_pdf_robust(page, pdf_url, dest):
-                return dest
+            downloaded = download_pdf_robust(page, pdf_url, dest)
 
-        # 2. Fallback: print to PDF with good quality
-        log.info("  Download failed, falling back to print-to-PDF (scale=0.85, background on)")
-        # Scroll to load lazy content
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1_000)
-        # Remove only non-essential elements
-        page.evaluate("""() => {
-            ['.cookie-bar', '.back-to-top', '.share-buttons']
-            .forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
-        }""")
+        if downloaded:
+            return dest
+
+        # 如果下載失敗，重新載入文章頁（因為下載嘗試可能已導航離開）
+        log.info("  Download failed, reloading article page for printing")
+        page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
+        page.wait_for_timeout(2_000)
+
+        # 提取文章主體並打印
+        log.info("  Printing article content (scale=0.6)")
+        page.evaluate("""
+            () => {
+                // 嘗試搵出文章主體
+                const selectors = ['article', 'main', '.content', '.article-content', '.news-content', '.post-content', '.entry-content'];
+                let content = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { content = el; break; }
+                }
+                if (!content) {
+                    // 如果搵唔到，就用 body，但移除導航等雜項
+                    content = document.body;
+                    const removeSelectors = ['header', 'nav', 'footer', 'aside', '.sidebar', '.cookie-bar', '.share-buttons', '.social-share', '.related-posts', '.advertisement', '.breadcrumb'];
+                    removeSelectors.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                }
+                // 清空 body，放入文章內容
+                document.body.innerHTML = '';
+                const wrapper = document.createElement('div');
+                wrapper.id = 'print-content';
+                wrapper.style.cssText = 'margin:0 auto; padding:20px; max-width:900px; background:white; font-size:14px; line-height:1.6;';
+                wrapper.appendChild(content.cloneNode(true));
+                document.body.appendChild(wrapper);
+                // 壓縮圖片尺寸
+                document.querySelectorAll('img').forEach(img => {
+                    img.style.maxWidth = '100%';
+                    img.style.height = 'auto';
+                });
+                // 移除不需要的樣式
+                document.querySelectorAll('*').forEach(el => {
+                    if (el.style) {
+                        el.style.removeProperty('position');
+                        el.style.removeProperty('top');
+                        el.style.removeProperty('left');
+                        el.style.removeProperty('transform');
+                    }
+                });
+            }
+        """)
+
+        # 打印成 PDF
         page.add_style_tag(content=(
             "@media print{body{-webkit-print-color-adjust:exact !important;"
             "print-color-adjust:exact !important}}"
         ))
-        page.pdf(path=str(dest), format="A4", print_background=True, scale=0.85)
+        page.pdf(path=str(dest), format="A4", print_background=True, scale=0.6)
 
         if dest.exists() and dest.stat().st_size > 2_000:
             return dest
@@ -497,7 +532,6 @@ def main(year: int, month: int) -> None:
             browser.close()
             return
 
-        # Sort by full_date
         sorted_items = sorted(all_items.values(), key=lambda x: x["full_date"])
         log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
 
@@ -513,12 +547,10 @@ def main(year: int, month: int) -> None:
                 except Exception as e:
                     log.warning(f"  Could not append {pdf_path.name}: {e}")
 
-        # 輸出檔案名稱改回原樣，與上傳步驟一致
         output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
             writer.write(fh)
 
-        # If still too large, re-compress
         size = output.stat().st_size
         if size > MAX_PDF_SIZE:
             log.info(f"PDF size {size/1_048_576:.2f} MB exceeds 5MB, applying re-compression...")
