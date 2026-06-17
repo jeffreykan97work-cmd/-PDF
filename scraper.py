@@ -379,24 +379,24 @@ def collect_source(
     return all_items
 
 
-# ── Article rendering (with scale to reduce size) ─────────────────────────
+# ── Article rendering ────────────────────────────────────────────────────
 def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
     """
-    Download PDF from a link. Use page.expect_download (not context).
-    Retry once if fails.
+    Download PDF by navigating directly to the URL and capturing download event.
+    Retry once.
     """
     for attempt in range(2):
         try:
-            with page.expect_download(timeout=45_000) as download_info:
-                # Open in new tab to avoid navigation
-                page.evaluate(f"window.open('{url}', '_blank')")
+            # Use page.goto with wait_until="commit" to avoid waiting for full page load
+            with page.expect_download(timeout=120_000) as download_info:
+                page.goto(url, wait_until="commit", timeout=30_000)
             download = download_info.value
             download.save_as(dest)
             if dest.exists() and dest.stat().st_size > 2_000:
                 return True
         except Exception as e:
             log.warning(f"  PDF download attempt {attempt+1} failed ({url}): {e}")
-            time.sleep(1)
+            time.sleep(2)
     return False
 
 
@@ -408,15 +408,21 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2_000)
 
-        # Try embedded PDF first
-        pdf_links: list[str] = page.evaluate(
-            "() => Array.from(document.querySelectorAll('a[href$=\".pdf\"],a[href*=\"download\"]'))"
-            ".map(a=>a.href)"
-        )
-        if pdf_links and download_pdf_robust(pdf_links[0], dest, page):
-            return dest
+        # Try to find a download link (either .pdf or download-pdf)
+        pdf_links: list[str] = page.evaluate("""
+            () => {
+                const links = Array.from(document.querySelectorAll('a[href$=".pdf"], a[href*="download-pdf"]'));
+                return links.map(a => a.href);
+            }
+        """)
+        # Remove duplicates
+        if pdf_links:
+            pdf_url = pdf_links[0]
+            if download_pdf_robust(pdf_url, dest, page):
+                return dest
 
-        # Full-page print-to-PDF with scale 0.85 to reduce file size
+        # Fallback: print to PDF with scale 0.85
+        log.info("  Download failed, falling back to print-to-PDF")
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
         page.evaluate("""() => {
@@ -476,6 +482,8 @@ def main(year: int, month: int) -> None:
         log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
 
         writer = PdfWriter()
+        writer.compress = True   # enable compression
+
         for i, item in enumerate(sorted_items, 1):
             log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['full_date']}] {item['text'][:50]}")
             pdf_path = process_article(page, item, tmp_dir, i)
@@ -487,7 +495,7 @@ def main(year: int, month: int) -> None:
 
         output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
-            writer.write(fh, compress=True)
+            writer.write(fh)   # writer.compress is already set
 
         # Check size and attempt further compression if > 5MB
         size = output.stat().st_size
@@ -495,11 +503,12 @@ def main(year: int, month: int) -> None:
             log.info(f"PDF size {size/1_048_576:.2f} MB exceeds 5MB, applying additional compression...")
             reader = PdfReader(output)
             writer2 = PdfWriter()
+            writer2.compress = True
             for p in reader.pages:
                 p.compress_content_streams()
                 writer2.add_page(p)
             with output.open("wb") as fh:
-                writer2.write(fh, compress=True)
+                writer2.write(fh)
             new_size = output.stat().st_size
             log.info(f"Compressed size: {new_size/1_048_576:.2f} MB")
 
