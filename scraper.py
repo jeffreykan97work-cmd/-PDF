@@ -59,10 +59,6 @@ def sanitize_filename(name: str, max_len: int = 100) -> str:
 
 
 def parse_datetime(raw: str) -> Optional[str]:
-    """
-    Extract date and time from raw text.
-    Returns ISO-like string "YYYY-MM-DDTHH:MM" or None.
-    """
     date_match = DATE_RE.search(raw)
     if not date_match:
         return None
@@ -113,7 +109,6 @@ _EXTRACT_JS = """
         const dateMatch = text.match(DATE_RE);
         if (!dateMatch) continue;
 
-        // Get surrounding container to search for time and link
         let container = node.parentElement;
         let fullText = container ? container.innerText : text;
         const fullDate = extractDateTime(fullText) || extractDateTime(text);
@@ -150,7 +145,6 @@ _EXTRACT_JS = """
         });
     }
 
-    // Holiday_weather: page itself is the article
     if (found.length === 0 && window.location.href.includes('Holiday_weather')) {
         const fullText = document.body.innerText;
         const fullDate = extractDateTime(fullText);
@@ -332,7 +326,6 @@ def collect_source(
                 full_date = item.get("full_date", "")
                 if len(full_date) < 10:
                     continue
-                # Compare year/month from full_date
                 try:
                     dt = datetime.fromisoformat(full_date)
                     ly, lm = dt.year, dt.month
@@ -388,14 +381,23 @@ def collect_source(
 
 # ── Article rendering (with scale to reduce size) ─────────────────────────
 def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
-    try:
-        with page.context.expect_download(timeout=45_000) as dl:
-            page.evaluate(f"window.open('{url}', '_blank')")
-        dl.value.save_as(dest)
-        return dest.exists() and dest.stat().st_size > 2_000
-    except Exception as e:
-        log.warning(f"  PDF download failed ({url}): {e}")
-        return False
+    """
+    Download PDF from a link. Use page.expect_download (not context).
+    Retry once if fails.
+    """
+    for attempt in range(2):
+        try:
+            with page.expect_download(timeout=45_000) as download_info:
+                # Open in new tab to avoid navigation
+                page.evaluate(f"window.open('{url}', '_blank')")
+            download = download_info.value
+            download.save_as(dest)
+            if dest.exists() and dest.stat().st_size > 2_000:
+                return True
+        except Exception as e:
+            log.warning(f"  PDF download attempt {attempt+1} failed ({url}): {e}")
+            time.sleep(1)
+    return False
 
 
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
@@ -485,7 +487,7 @@ def main(year: int, month: int) -> None:
 
         output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
-            writer.write(fh, compress=True)  # ensure compression
+            writer.write(fh, compress=True)
 
         # Check size and attempt further compression if > 5MB
         size = output.stat().st_size
@@ -494,7 +496,7 @@ def main(year: int, month: int) -> None:
             reader = PdfReader(output)
             writer2 = PdfWriter()
             for p in reader.pages:
-                p.compress_content_streams()  # compress page content
+                p.compress_content_streams()
                 writer2.add_page(p)
             with output.open("wb") as fh:
                 writer2.write(fh, compress=True)
