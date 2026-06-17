@@ -24,13 +24,14 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://www.smg.gov.mo"
 MAX_PDF_SIZE = 5 * 1024 * 1024  # 5 MB
 
+# 您可以在此增減來源，只保留您需要的
 SOURCES = [
     {"name": "news",            "url": f"{BASE_URL}/zh/news"},
     {"name": "activity",        "url": f"{BASE_URL}/zh/activity"},
     {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
     {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
     {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
-    {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
+    # {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},   # 可註解掉
 ]
 
 NAV_TIMEOUT   = 60_000   # ms
@@ -379,18 +380,43 @@ def collect_source(
     return all_items
 
 
-# ── Article rendering ────────────────────────────────────────────────────
-def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
+# ── Article rendering (improved) ──────────────────────────────────────────
+def download_pdf_robust(page: Page, pdf_url: str, dest: Path) -> bool:
+    """
+    Attempt to download PDF by clicking a download button or navigating directly.
+    """
+    # Try clicking on any visible "下載PDF" or "Download" button
+    download_btn_selectors = [
+        "a:has-text('下載PDF')",
+        "a:has-text('下載')",
+        "button:has-text('下載PDF')",
+        "button:has-text('下載')",
+        "a[href*='download']",
+    ]
+    for sel in download_btn_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() and btn.is_visible() and btn.is_enabled():
+                with page.expect_download(timeout=120_000) as download_info:
+                    btn.click()
+                download = download_info.value
+                download.save_as(dest)
+                if dest.exists() and dest.stat().st_size > 2_000:
+                    return True
+        except Exception:
+            continue
+
+    # Fallback: navigate directly to the URL
     for attempt in range(2):
         try:
             with page.expect_download(timeout=120_000) as download_info:
-                page.goto(url, wait_until="commit", timeout=30_000)
+                page.goto(pdf_url, wait_until="commit", timeout=30_000)
             download = download_info.value
             download.save_as(dest)
             if dest.exists() and dest.stat().st_size > 2_000:
                 return True
         except Exception as e:
-            log.warning(f"  PDF download attempt {attempt+1} failed ({url}): {e}")
+            log.warning(f"  PDF download attempt {attempt+1} failed ({pdf_url}): {e}")
             time.sleep(2)
     return False
 
@@ -401,9 +427,9 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
 
     try:
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(2_000)
+        page.wait_for_timeout(3_000)  # let any dynamic content load
 
-        # Try to find a download link
+        # 1. Look for a PDF download link or button
         pdf_links: list[str] = page.evaluate("""
             () => {
                 const links = Array.from(document.querySelectorAll('a[href$=".pdf"], a[href*="download-pdf"]'));
@@ -412,25 +438,28 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         """)
         if pdf_links:
             pdf_url = pdf_links[0]
-            if download_pdf_robust(pdf_url, dest, page):
+            if download_pdf_robust(page, pdf_url, dest):
                 return dest
 
-        # Fallback: print to PDF with lower scale to reduce size
-        log.info("  Download failed, falling back to print-to-PDF (scale=0.6)")
+        # 2. Fallback: print to PDF with good quality
+        log.info("  Download failed, falling back to print-to-PDF (scale=0.85, background on)")
+        # Scroll to load lazy content
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
+        # Optionally remove only ads or unimportant elements (keep header/nav for context)
+        # We'll remove only elements that are clearly not part of content
         page.evaluate("""() => {
-            ['header','nav','footer','#header','#footer','#nav',
-             '.site-header','.breadcrumb','.cookie-bar','.back-to-top',
-             '.navbar-top','.sticky-header']
+            // Remove only these if they exist and are not main content
+            ['.cookie-bar', '.back-to-top', '.share-buttons']
             .forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
         }""")
+        # Ensure background color and images are printed
         page.add_style_tag(content=(
             "@media print{body{-webkit-print-color-adjust:exact !important;"
             "print-color-adjust:exact !important}}"
         ))
-        # Use scale 0.6 and disable background to further reduce size
-        page.pdf(path=str(dest), format="A4", print_background=False, scale=0.6)
+        # Use scale 0.85 for a balance, keep background
+        page.pdf(path=str(dest), format="A4", print_background=True, scale=0.85)
 
         if dest.exists() and dest.stat().st_size > 2_000:
             return dest
@@ -488,11 +517,11 @@ def main(year: int, month: int) -> None:
                 except Exception as e:
                     log.warning(f"  Could not append {pdf_path.name}: {e}")
 
-        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
+        output = Path(f"SMG_News_Report_{year}_{month:02d}.pdf")  # 改名避免誤會
         with output.open("wb") as fh:
             writer.write(fh)
 
-        # If still too large, attempt to re-compress using a new writer
+        # If still too large, re-compress
         size = output.stat().st_size
         if size > MAX_PDF_SIZE:
             log.info(f"PDF size {size/1_048_576:.2f} MB exceeds 5MB, applying re-compression...")
@@ -507,7 +536,7 @@ def main(year: int, month: int) -> None:
                 new_size = output.stat().st_size
                 log.info(f"Re-compressed size: {new_size/1_048_576:.2f} MB")
                 if new_size > MAX_PDF_SIZE:
-                    log.warning(f"Still exceeds 5MB ({new_size/1_048_576:.2f} MB). Consider further manual optimization.")
+                    log.warning(f"Still exceeds 5MB ({new_size/1_048_576:.2f} MB).")
             except Exception as e:
                 log.warning(f"Re-compression failed: {e}")
 
