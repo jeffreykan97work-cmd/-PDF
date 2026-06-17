@@ -381,13 +381,8 @@ def collect_source(
 
 # ── Article rendering ────────────────────────────────────────────────────
 def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
-    """
-    Download PDF by navigating directly to the URL and capturing download event.
-    Retry once.
-    """
     for attempt in range(2):
         try:
-            # Use page.goto with wait_until="commit" to avoid waiting for full page load
             with page.expect_download(timeout=120_000) as download_info:
                 page.goto(url, wait_until="commit", timeout=30_000)
             download = download_info.value
@@ -408,21 +403,20 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2_000)
 
-        # Try to find a download link (either .pdf or download-pdf)
+        # Try to find a download link
         pdf_links: list[str] = page.evaluate("""
             () => {
                 const links = Array.from(document.querySelectorAll('a[href$=".pdf"], a[href*="download-pdf"]'));
                 return links.map(a => a.href);
             }
         """)
-        # Remove duplicates
         if pdf_links:
             pdf_url = pdf_links[0]
             if download_pdf_robust(pdf_url, dest, page):
                 return dest
 
-        # Fallback: print to PDF with scale 0.85
-        log.info("  Download failed, falling back to print-to-PDF")
+        # Fallback: print to PDF with lower scale to reduce size
+        log.info("  Download failed, falling back to print-to-PDF (scale=0.6)")
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
         page.evaluate("""() => {
@@ -435,7 +429,8 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
             "@media print{body{-webkit-print-color-adjust:exact !important;"
             "print-color-adjust:exact !important}}"
         ))
-        page.pdf(path=str(dest), format="A4", print_background=True, scale=0.85)
+        # Use scale 0.6 and disable background to further reduce size
+        page.pdf(path=str(dest), format="A4", print_background=False, scale=0.6)
 
         if dest.exists() and dest.stat().st_size > 2_000:
             return dest
@@ -477,12 +472,12 @@ def main(year: int, month: int) -> None:
             browser.close()
             return
 
-        # Sort by full_date (ISO format, includes time)
+        # Sort by full_date
         sorted_items = sorted(all_items.values(), key=lambda x: x["full_date"])
         log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
 
         writer = PdfWriter()
-        writer.compress = True   # enable compression
+        writer.compress = True
 
         for i, item in enumerate(sorted_items, 1):
             log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['full_date']}] {item['text'][:50]}")
@@ -495,22 +490,26 @@ def main(year: int, month: int) -> None:
 
         output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
-            writer.write(fh)   # writer.compress is already set
+            writer.write(fh)
 
-        # Check size and attempt further compression if > 5MB
+        # If still too large, attempt to re-compress using a new writer
         size = output.stat().st_size
         if size > MAX_PDF_SIZE:
-            log.info(f"PDF size {size/1_048_576:.2f} MB exceeds 5MB, applying additional compression...")
-            reader = PdfReader(output)
-            writer2 = PdfWriter()
-            writer2.compress = True
-            for p in reader.pages:
-                p.compress_content_streams()
-                writer2.add_page(p)
-            with output.open("wb") as fh:
-                writer2.write(fh)
-            new_size = output.stat().st_size
-            log.info(f"Compressed size: {new_size/1_048_576:.2f} MB")
+            log.info(f"PDF size {size/1_048_576:.2f} MB exceeds 5MB, applying re-compression...")
+            try:
+                reader = PdfReader(output)
+                writer2 = PdfWriter()
+                writer2.compress = True
+                for page_obj in reader.pages:
+                    writer2.add_page(page_obj)
+                with output.open("wb") as fh:
+                    writer2.write(fh)
+                new_size = output.stat().st_size
+                log.info(f"Re-compressed size: {new_size/1_048_576:.2f} MB")
+                if new_size > MAX_PDF_SIZE:
+                    log.warning(f"Still exceeds 5MB ({new_size/1_048_576:.2f} MB). Consider further manual optimization.")
+            except Exception as e:
+                log.warning(f"Re-compression failed: {e}")
 
         mb = output.stat().st_size / 1_048_576
         log.info(f"\n✅ Done: {output.name}  ({mb:.2f} MB)")
