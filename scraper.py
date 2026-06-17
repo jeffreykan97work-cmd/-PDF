@@ -134,16 +134,14 @@ _EXTRACT_JS = """
 }
 """
 
-# ── Pagination info extraction (mainly for max_page) ─────────────────────
+# ── Pagination info extraction ────────────────────────────────────────────
 _PAGINATION_JS = """
 () => {
-    // Try to get total pages from text like "共 N 頁"
     const bodyText = document.body.innerText;
     const m = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+pages?/i);
     let maxPage = 1;
     if (m) maxPage = parseInt(m[1], 10);
-
-    // Also check for pagination links with numbers
+    // Also check page number links
     const links = Array.from(document.querySelectorAll('a[href*="page"]'));
     links.forEach(a => {
         const href = a.getAttribute('href');
@@ -183,26 +181,39 @@ def get_max_page(page: Page) -> int:
         return 1
 
 
-def get_articles_hash(page: Page) -> str:
-    """Get a hash of the article list container to detect content changes."""
+def get_current_page(page: Page) -> int:
+    """Extract the current page number from pagination UI (highlighted)."""
     try:
-        # Try to find a common container for articles (adjust selectors if needed)
-        # We'll just hash the entire body text of all links containing dates
-        text = page.evaluate("""
-            () => {
-                const items = Array.from(document.querySelectorAll('a, .item, .news-item, .article'));
-                return items.map(el => el.innerText).join('|');
-            }
-        """)
-        return hashlib.md5(text.encode()).hexdigest()
+        # Look for active/current page number
+        selectors = [
+            ".pagination .active",
+            ".pagination .current",
+            ".pager-current",
+            ".active a",
+            "li.active a",
+            "span.current",
+        ]
+        for sel in selectors:
+            elem = page.locator(sel)
+            if elem.count():
+                text = elem.inner_text().strip()
+                if text.isdigit():
+                    return int(text)
+        # Try to find any number that is highlighted (e.g., bold or different color)
+        # Fallback: find the first number that is not a link? Or assume 1?
+        # We'll just return 1 if cannot determine.
+        return 1
     except Exception:
-        return ""
+        return 1
 
 
 def click_next_page(page: Page) -> bool:
-    """Click the 'next page' button. Return True if clicked, False if not found/disabled."""
-    # Common selectors for next button
-    selectors = [
+    """
+    Click the next page button or the next page number.
+    Returns True if clicked, False if no next page found.
+    """
+    # 1. Try explicit "next" button
+    next_selectors = [
         "a:has-text('下一頁')",
         "a:has-text('下一页')",
         "a:has-text('Next')",
@@ -212,11 +223,8 @@ def click_next_page(page: Page) -> bool:
         ".pagination .next a",
         ".pager-next a",
         "a[rel='next']",
-        "button:has-text('下一頁')",
-        "button:has-text('下一页')",
-        "button:has-text('Next')",
     ]
-    for sel in selectors:
+    for sel in next_selectors:
         try:
             loc = page.locator(sel)
             if loc.count() > 0 and loc.is_visible() and loc.is_enabled():
@@ -224,21 +232,63 @@ def click_next_page(page: Page) -> bool:
                 return True
         except Exception:
             continue
-    # Try to find any <a> that contains a number and is after current active page
+
+    # 2. Try to click the specific next page number (current + 1)
+    current = get_current_page(page)
+    target = current + 1
+    # Look for a link containing the target number, but ensure it's not just part of a larger number
+    # Use exact text match or pattern
     try:
-        # If we can find current page number, try to click the next number
-        current = page.locator(".pagination .active, .pagination .current, .pager-current")
-        if current.count():
-            cur_num = int(current.inner_text().strip())
-            next_num = cur_num + 1
-            # Look for a link with that exact number
-            next_link = page.locator(f"a:has-text('{next_num}')")
-            if next_link.count() and next_link.is_visible():
-                next_link.click()
+        # Find all links with numbers
+        links = page.locator("a").all()
+        for link in links:
+            text = link.inner_text().strip()
+            if text == str(target) or (text.isdigit() and int(text) == target):
+                if link.is_visible() and link.is_enabled():
+                    link.click()
+                    return True
+    except Exception:
+        pass
+
+    # 3. Try to find any pagination link with a number greater than current, and pick the smallest
+    try:
+        # Find all visible numbers in pagination container
+        pagination = page.locator(".pagination, .pager, .page-nav, [class*='pagination'], [class*='pager']")
+        if pagination.count():
+            numbers = pagination.locator("a, span").all()
+            max_num = current
+            target_el = None
+            for el in numbers:
+                text = el.inner_text().strip()
+                if text.isdigit():
+                    num = int(text)
+                    if num > current and (target_el is None or num < max_num):
+                        max_num = num
+                        target_el = el
+            if target_el and target_el.is_visible() and target_el.is_enabled():
+                target_el.click()
                 return True
     except Exception:
         pass
+
+    # 4. If still not found, try to click on an element that contains "..." or similar (maybe ellipsis)
     return False
+
+
+def get_articles_hash(page: Page) -> str:
+    """Get a hash of the article list container to detect content changes."""
+    try:
+        # We'll use the text content of all links that contain dates (or all a tags)
+        text = page.evaluate("""
+            () => {
+                // Try to find article items by common class names
+                const items = Array.from(document.querySelectorAll('.item, .news-item, .article, a'));
+                return items.map(el => el.innerText).join('|');
+            }
+        """)
+        return hashlib.md5(text.encode()).hexdigest()
+    except Exception:
+        return ""
 
 
 # ── MODIFIED: collect_source using click-based pagination ────────────────
@@ -262,7 +312,6 @@ def collect_source(
     page_num = 1
     empty_page_count = 0
     found_older = False
-    last_hash = ""
 
     while page_num <= MAX_PAGES:
         # Extract articles
@@ -302,7 +351,7 @@ def collect_source(
             if found_older:
                 break
 
-        # Attempt to go to next page
+        # Check if we've reached max_page
         if page_num >= max_page:
             log.info(f"  Reached max_page {max_page}, stopping")
             break
@@ -313,20 +362,13 @@ def collect_source(
         # Click next page
         clicked = click_next_page(page)
         if not clicked:
-            log.info("  No 'next page' button found or disabled, stopping")
+            log.info("  No 'next page' button or number found, stopping")
             break
 
         # Wait for content to update
-        page.wait_for_timeout(2_000)  # give some time for Vue to update
-        try:
-            page.wait_for_function(
-                f"() => {{ return document.body.innerText.length > {len(page.inner_text('body')) // 2}; }}",
-                timeout=10_000
-            )
-        except Exception:
-            pass
+        page.wait_for_timeout(2_000)  # initial wait for Vue to react
 
-        # Wait until content hash changes (or at least wait for network idle)
+        # Wait until content hash changes (or timeout)
         try:
             page.wait_for_function(
                 f"() => {{ const h = '{get_articles_hash(page)}'; return h !== '{before_hash}'; }}",
