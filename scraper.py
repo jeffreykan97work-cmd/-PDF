@@ -7,6 +7,7 @@ import time
 from datetime import date
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from playwright.sync_api import Page, sync_playwright
 from pypdf import PdfWriter
@@ -36,9 +37,6 @@ RENDER_WAIT   = 5_000    # ms — after navigation, wait for Vue to render data
 MAX_PAGES     = 50       # safety cap on pagination depth
 
 # ── BUG-FIX 1: Date regex ──────────────────────────────────────────────────
-# Original alternation (0?[1-9]|[12]\d|3[01]) matches only the first digit of
-# two-digit values like "20" because "0?" matches empty and "[1-9]" matches "2".
-# Fix: put two-digit alternatives FIRST so they are tried before single-digit.
 DATE_RE = re.compile(
     r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
@@ -47,7 +45,6 @@ DATE_RE = re.compile(
     r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
 )
 
-# JS version (injected into browser) — no Python escaping needed for /regex/
 _JS_DATE_RE = r"(20\d{{2}})[\s\-/年.]+(1[0-2]|0?[1-9])[\s\-/月.]+([12]\d|3[01]|0?[1-9])"
 
 
@@ -89,7 +86,6 @@ _EXTRACT_JS = """
         const match = text.match(DATE_RE);
         if (!match) continue;
 
-        // BUG-FIX: corrected group order — two-digit day captured properly
         const dateStr = match[1] + '-'
             + match[2].padStart(2, '0') + '-'
             + match[3].padStart(2, '0');
@@ -112,7 +108,6 @@ _EXTRACT_JS = """
                 const m2 = oc.match(/['"](\\/[^'"]+)['"]/);
                 if (m2) href = m2[1];
             }
-            // Skip pagination links themselves
             if (!href || /\\/page\\/\\d+/.test(href) || href.includes('?page=')) return;
 
             const url = abs(href);
@@ -127,7 +122,6 @@ _EXTRACT_JS = """
         });
     }
 
-    // Holiday_weather: page itself is the article
     if (found.length === 0 && window.location.href.includes('Holiday_weather')) {
         const m = document.body.innerText.match(DATE_RE);
         if (m) found.push({
@@ -140,32 +134,40 @@ _EXTRACT_JS = """
 }
 """
 
-# ── Pagination: find max page number from rendered DOM ────────────────────
+# ── Pagination: find max page number and page link template ──────────────
 _PAGINATION_JS = """
 () => {
-    // Look for <a href="/zh/.../page/N"> links
-    const links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
+    const links = Array.from(document.querySelectorAll('a[href*="page"]'));
     let maxPage = 1;
+    let template = null;
     links.forEach(a => {
-        const m = a.href.match(/\\/page\\/(\\d+)/);
-        if (m) maxPage = Math.max(maxPage, parseInt(m[1], 10));
+        const href = a.getAttribute('href');
+        // Try to extract page number
+        let m = href.match(/\\/page\\/(\\d+)/);
+        if (m) {
+            const num = parseInt(m[1], 10);
+            if (num > maxPage) maxPage = num;
+            if (!template) template = href.replace(/\\/page\\/\\d+/, '/page/{page}');
+        }
+        m = href.match(/[?&]page=(\\d+)/);
+        if (m) {
+            const num = parseInt(m[1], 10);
+            if (num > maxPage) maxPage = num;
+            if (!template) template = href.replace(/[?&]page=\\d+/, '{page}');
+        }
     });
-
-    // Also check text like "共 N 頁" / "Page N of M"
+    // Also check text like "共 N 頁"
     const bodyText = document.body.innerText;
     const m2 = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+pages?/i);
     if (m2) maxPage = Math.max(maxPage, parseInt(m2[1], 10));
 
-    return maxPage;
+    return { maxPage, template };
 }
 """
 
 
 def navigate_and_wait(page: Page, url: str) -> bool:
-    """Navigate to url, wait for Vue to render. Returns True on success."""
     try:
-        # BUG-FIX 2 (key): use "networkidle" so Vue has time to fetch & render
-        # its article list before we try to read the DOM.
         page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(RENDER_WAIT)
         return True
@@ -182,11 +184,13 @@ def extract_page_articles(page: Page) -> list[dict]:
         return []
 
 
-def get_max_page(page: Page) -> int:
+def get_pagination_info(page: Page) -> tuple[int, Optional[str]]:
+    """Return (max_page, template) where template is a string with '{page}' placeholder."""
     try:
-        return max(1, int(page.evaluate(_PAGINATION_JS)))
+        result = page.evaluate(_PAGINATION_JS)
+        return result.get("maxPage", 1), result.get("template")
     except Exception:
-        return 1
+        return 1, None
 
 
 # ── MODIFIED: collect_source with intelligent pagination ──────────────────
@@ -196,61 +200,74 @@ def collect_source(
     year: int,
     month: int,
 ) -> dict[str, dict]:
-    """
-    Scan one source section across all its listing pages.
-
-    MODIFIED: Now continues pagination until we explicitly see an article
-    older than the target month, or until we exhaust all pages. Also handles
-    empty pages gracefully.
-    """
     all_items: dict[str, dict] = {}
     base_url = src["url"].rstrip("/")
     source_name = src["name"]
 
-    # Load page 1 first to initialise Vue
+    # Load page 1
     log.info(f"  Loading page 1: {base_url}")
     if not navigate_and_wait(page, base_url):
         return {}
 
-    # Get initial max page (may be updated later)
-    max_page = get_max_page(page)
-    log.info(f"  Detected initial max page: {max_page}")
+    # Get pagination info (max page and URL template)
+    max_page, template = get_pagination_info(page)
+    log.info(f"  Detected max page: {max_page}, template: {template}")
+
+    # If no template found, try to guess common patterns
+    def build_page_url(n: int) -> str:
+        if template:
+            # Replace {page} placeholder
+            return template.replace("{page}", str(n))
+        else:
+            # Fallback: try query parameter, then path
+            parsed = urlparse(base_url)
+            # Try ?page=N
+            qs = parse_qs(parsed.query)
+            qs["page"] = [str(n)]
+            new_query = urlencode(qs, doseq=True)
+            new_url = urlunparse(parsed._replace(query=new_query))
+            return new_url
 
     page_num = 1
-    empty_page_count = 0   # consecutive empty pages
+    empty_page_count = 0
     found_older = False
 
     while page_num <= MAX_PAGES:
-        # Navigate to the current page (if not page 1)
         if page_num > 1:
-            page_url = f"{base_url}/page/{page_num}"
+            # Build URL using the template (or fallback)
+            page_url = build_page_url(page_num)
             log.info(f"  Loading page {page_num}: {page_url}")
             if not navigate_and_wait(page, page_url):
                 break
-            # Verify that we actually landed on /page/N (avoid SPA fallback)
-            if f"/page/{page_num}" not in page.url:
-                log.info(f"  Page {page_num} not found (URL unchanged), stopping")
-                break
+
+            # Verify that we actually navigated to a different page
+            # Check if the URL contains any page indicator (either ?page= or /page/)
+            if "?page=" not in page.url and "/page/" not in page.url:
+                # Also check if the page content changed? We'll check if we got articles or not
+                # But better: if we requested a page and URL didn't change, assume failure
+                # We can compare requested URL vs current URL (ignoring fragments)
+                req_parsed = urlparse(page_url)
+                cur_parsed = urlparse(page.url)
+                if req_parsed.path == cur_parsed.path and req_parsed.query == cur_parsed.query:
+                    log.info(f"  Page {page_num} not found (URL unchanged), stopping")
+                    break
         else:
-            # Page 1 already loaded
+            # Already on page 1
             pass
 
-        # Extract articles from current page
         articles = extract_page_articles(page)
 
         if not articles:
             empty_page_count += 1
             log.info(f"  Page {page_num}: no articles extracted (empty count {empty_page_count})")
-            # If two consecutive empty pages and not page 1, assume end of content
             if empty_page_count >= 2 and page_num > 1:
                 log.info("  Two consecutive empty pages → stopping")
                 break
             page_num += 1
             continue
         else:
-            empty_page_count = 0   # reset
+            empty_page_count = 0
 
-        # Process articles: collect target month and check for older
         added = 0
         for item in articles:
             ds = item.get("date_str", "")
@@ -263,7 +280,6 @@ def collect_source(
 
             if (ly, lm) < (year, month):
                 found_older = True
-                # Keep processing to also collect target month entries on same page
             elif (ly, lm) == (year, month):
                 url = item["url"]
                 if url not in all_items:
@@ -276,17 +292,18 @@ def collect_source(
             f"older_found={found_older}"
         )
 
-        # If we found an older article, we can stop (subsequent pages are even older)
         if found_older:
             break
 
-        # Update max_page dynamically (pagination links may appear later)
-        current_max = get_max_page(page)
-        if current_max > max_page:
-            max_page = current_max
+        # Update max_page dynamically (in case pagination info changes)
+        new_max, new_template = get_pagination_info(page)
+        if new_max > max_page:
+            max_page = new_max
             log.info(f"  Updated max_page to {max_page}")
+        if new_template and new_template != template:
+            template = new_template
+            log.info(f"  Updated template to {template}")
 
-        # Stop if we have reached the known last page
         if page_num >= max_page:
             log.info(f"  Reached max_page {max_page}, stopping")
             break
@@ -317,7 +334,6 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2_000)
 
-        # Try embedded PDF first
         pdf_links: list[str] = page.evaluate(
             "() => Array.from(document.querySelectorAll('a[href$=\".pdf\"],a[href*=\"download\"]'))"
             ".map(a=>a.href)"
@@ -325,10 +341,8 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         if pdf_links and download_pdf_robust(pdf_links[0], dest, page):
             return dest
 
-        # Full-page print-to-PDF
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
-        # BUG-FIX 5: remove only known chrome elements, not generic .navbar
         page.evaluate("""() => {
             ['header','nav','footer','#header','#footer','#nav',
              '.site-header','.breadcrumb','.cookie-bar','.back-to-top',
