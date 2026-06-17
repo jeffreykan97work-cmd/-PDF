@@ -32,17 +32,17 @@ SOURCES = [
     {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
 ]
 
-NAV_TIMEOUT   = 60_000   # ms — page navigation
-RENDER_WAIT   = 5_000    # ms — after navigation, wait for Vue to render data
-MAX_PAGES     = 50       # safety cap on pagination depth
+NAV_TIMEOUT   = 60_000   # ms
+RENDER_WAIT   = 5_000    # ms
+MAX_PAGES     = 50       # safety cap
 
-# ── BUG-FIX 1: Date regex ──────────────────────────────────────────────────
+# ── Date regex (fixed) ────────────────────────────────────────────────────
 DATE_RE = re.compile(
     r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
-    r"(1[0-2]|0?[1-9])"           # month — two-digit first
+    r"(1[0-2]|0?[1-9])"           # month
     r"[\s\-\/月\.]+"
-    r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
+    r"([12]\d|3[01]|0?[1-9])"     # day
 )
 
 _JS_DATE_RE = r"(20\d{{2}})[\s\-/年.]+(1[0-2]|0?[1-9])[\s\-/月.]+([12]\d|3[01]|0?[1-9])"
@@ -65,7 +65,7 @@ def parse_date_str(raw: str) -> Optional[str]:
     return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
 
 
-# ── Core: extract article links from current page DOM ─────────────────────
+# ── Core: extract article links ────────────────────────────────────────────
 _EXTRACT_JS = """
 () => {
     const DATE_RE = /(20\\d{2})[\\s\\-\\/年.]+(1[0-2]|0?[1-9])[\\s\\-\\/月.]+([12]\\d|3[01]|0?[1-9])/;
@@ -134,32 +134,60 @@ _EXTRACT_JS = """
 }
 """
 
-# ── Pagination: find max page number and page link template ──────────────
+# ── Pagination info extraction (IMPROVED) ────────────────────────────────
 _PAGINATION_JS = """
 () => {
+    // Find all <a> tags that contain "page"
     const links = Array.from(document.querySelectorAll('a[href*="page"]'));
     let maxPage = 1;
     let template = null;
+    const pageNumbers = [];
+
     links.forEach(a => {
         const href = a.getAttribute('href');
-        // Try to extract page number
+        // Try to extract page number from href
         let m = href.match(/\\/page\\/(\\d+)/);
         if (m) {
             const num = parseInt(m[1], 10);
             if (num > maxPage) maxPage = num;
-            if (!template) template = href.replace(/\\/page\\/\\d+/, '/page/{page}');
+            pageNumbers.push(num);
+            // Build template by replacing the numeric part with {page}
+            const candidate = href.replace(/\\/page\\/\\d+/, '/page/{page}');
+            if (!template) template = candidate;
         }
         m = href.match(/[?&]page=(\\d+)/);
         if (m) {
             const num = parseInt(m[1], 10);
             if (num > maxPage) maxPage = num;
-            if (!template) template = href.replace(/[?&]page=\\d+/, '{page}');
+            pageNumbers.push(num);
+            const candidate = href.replace(/[?&]page=\\d+/, '?page={page}');
+            if (!template) template = candidate;
         }
     });
+
     // Also check text like "共 N 頁"
     const bodyText = document.body.innerText;
     const m2 = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+pages?/i);
     if (m2) maxPage = Math.max(maxPage, parseInt(m2[1], 10));
+
+    // If no template found, try to infer from current URL
+    if (!template) {
+        const currentUrl = window.location.href;
+        let m = currentUrl.match(/\\/page\\/(\\d+)/);
+        if (m) {
+            template = currentUrl.replace(/\\/page\\/\\d+/, '/page/{page}');
+        } else {
+            m = currentUrl.match(/[?&]page=(\\d+)/);
+            if (m) {
+                template = currentUrl.replace(/[?&]page=\\d+/, '?page={page}');
+            }
+        }
+    }
+
+    // Ensure template is absolute (with origin)
+    if (template && template.startsWith('/')) {
+        template = window.location.origin + template;
+    }
 
     return { maxPage, template };
 }
@@ -185,12 +213,30 @@ def extract_page_articles(page: Page) -> list[dict]:
 
 
 def get_pagination_info(page: Page) -> tuple[int, Optional[str]]:
-    """Return (max_page, template) where template is a string with '{page}' placeholder."""
+    """Return (max_page, template_absolute_url)"""
     try:
         result = page.evaluate(_PAGINATION_JS)
         return result.get("maxPage", 1), result.get("template")
     except Exception:
         return 1, None
+
+
+def build_page_url(base_url: str, template: Optional[str], n: int) -> str:
+    """Build absolute URL for page number n using template or fallback."""
+    if template:
+        url = template.replace("{page}", str(n))
+        # If still relative (shouldn't happen after absolute conversion), make absolute
+        if url.startswith('/'):
+            parsed_base = urlparse(base_url)
+            url = urlunparse((parsed_base.scheme, parsed_base.netloc, url, '', '', ''))
+        return url
+    else:
+        # Fallback: try ?page=N
+        parsed = urlparse(base_url)
+        qs = parse_qs(parsed.query)
+        qs["page"] = [str(n)]
+        new_query = urlencode(qs, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
 
 
 # ── MODIFIED: collect_source with intelligent pagination ──────────────────
@@ -213,44 +259,22 @@ def collect_source(
     max_page, template = get_pagination_info(page)
     log.info(f"  Detected max page: {max_page}, template: {template}")
 
-    # If no template found, try to guess common patterns
-    def build_page_url(n: int) -> str:
-        if template:
-            # Replace {page} placeholder
-            return template.replace("{page}", str(n))
-        else:
-            # Fallback: try query parameter, then path
-            parsed = urlparse(base_url)
-            # Try ?page=N
-            qs = parse_qs(parsed.query)
-            qs["page"] = [str(n)]
-            new_query = urlencode(qs, doseq=True)
-            new_url = urlunparse(parsed._replace(query=new_query))
-            return new_url
-
     page_num = 1
     empty_page_count = 0
     found_older = False
 
     while page_num <= MAX_PAGES:
         if page_num > 1:
-            # Build URL using the template (or fallback)
-            page_url = build_page_url(page_num)
+            page_url = build_page_url(base_url, template, page_num)
             log.info(f"  Loading page {page_num}: {page_url}")
             if not navigate_and_wait(page, page_url):
                 break
 
-            # Verify that we actually navigated to a different page
-            # Check if the URL contains any page indicator (either ?page= or /page/)
-            if "?page=" not in page.url and "/page/" not in page.url:
-                # Also check if the page content changed? We'll check if we got articles or not
-                # But better: if we requested a page and URL didn't change, assume failure
-                # We can compare requested URL vs current URL (ignoring fragments)
-                req_parsed = urlparse(page_url)
-                cur_parsed = urlparse(page.url)
-                if req_parsed.path == cur_parsed.path and req_parsed.query == cur_parsed.query:
-                    log.info(f"  Page {page_num} not found (URL unchanged), stopping")
-                    break
+            # Verify URL changed (prevent infinite loop)
+            if page.url == page_url or page.url == base_url:
+                # If we're still on the same page, stop
+                log.info(f"  Page {page_num} not reached (URL unchanged), stopping")
+                break
         else:
             # Already on page 1
             pass
@@ -295,7 +319,7 @@ def collect_source(
         if found_older:
             break
 
-        # Update max_page dynamically (in case pagination info changes)
+        # Update pagination info dynamically (in case it changes)
         new_max, new_template = get_pagination_info(page)
         if new_max > max_page:
             max_page = new_max
@@ -375,7 +399,7 @@ def main(year: int, month: int) -> None:
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx  = browser.new_context(
+        ctx = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             accept_downloads=True,
         )
