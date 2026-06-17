@@ -24,12 +24,13 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://www.smg.gov.mo"
 MAX_PDF_SIZE = 5 * 1024 * 1024  # 5 MB
 
+# 只保留新聞和活動，排除可能包含月報嘅來源
 SOURCES = [
     {"name": "news",            "url": f"{BASE_URL}/zh/news"},
     {"name": "activity",        "url": f"{BASE_URL}/zh/activity"},
-    {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
-    {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
-    {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
+    # {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
+    # {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
+    # {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
     # {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
 ]
 
@@ -377,72 +378,24 @@ def collect_source(
 
 
 # ── Article rendering ────────────────────────────────────────────────────
-def download_pdf_robust(page: Page, pdf_url: str, dest: Path) -> bool:
-    # 嘗試點擊「下載 PDF」按鈕
-    download_btn_selectors = [
-        "a:has-text('下載PDF')", "a:has-text('下載')",
-        "button:has-text('下載PDF')", "button:has-text('下載')",
-        "a[href*='download']", "a[href$='.pdf']"
-    ]
-    for sel in download_btn_selectors:
-        try:
-            btn = page.locator(sel).first
-            if btn.count() and btn.is_visible() and btn.is_enabled():
-                with page.expect_download(timeout=180_000) as download_info:
-                    btn.click()
-                download = download_info.value
-                download.save_as(dest)
-                if dest.exists() and dest.stat().st_size > 2_000:
-                    return True
-        except Exception:
-            continue
-
-    # 直接導航到 PDF 連結
-    for attempt in range(2):
-        try:
-            with page.expect_download(timeout=180_000) as download_info:
-                page.goto(pdf_url, wait_until="commit", timeout=30_000)
-            download = download_info.value
-            download.save_as(dest)
-            if dest.exists() and dest.stat().st_size > 2_000:
-                return True
-        except Exception as e:
-            log.warning(f"  PDF download attempt {attempt+1} failed ({pdf_url}): {e}")
-            time.sleep(3)
-    return False
-
-
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
     safe = item["text"][:30].replace("/", "-")
     dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['full_date'].replace(':', '-')}_{safe}.pdf")
 
     try:
-        # 先載入文章頁
+        # 載入文章頁
         log.info(f"  Loading article: {item['url']}")
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(3_000)
 
-        # 嘗試下載 PDF
-        pdf_links: list[str] = page.evaluate("""
-            () => {
-                const links = Array.from(document.querySelectorAll('a[href$=".pdf"], a[href*="download-pdf"]'));
-                return links.map(a => a.href);
-            }
-        """)
-        downloaded = False
-        if pdf_links:
-            pdf_url = pdf_links[0]
-            downloaded = download_pdf_robust(page, pdf_url, dest)
+        # 檢查是否為月報頁面 (跳過)
+        title = page.title()
+        body_text = page.inner_text("body")
+        if "氣象觀測月報" in title or "氣象觀測月報" in body_text:
+            log.warning(f"  Skipping monthly report page: {item['url']}")
+            return None
 
-        if downloaded:
-            return dest
-
-        # 如果下載失敗，重新載入文章頁（因為下載嘗試可能已導航離開）
-        log.info("  Download failed, reloading article page for printing")
-        page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(2_000)
-
-        # 提取文章主體並打印
+        # 提取文章主體並打印（完全放棄下載 PDF）
         log.info("  Printing article content (scale=0.6)")
         page.evaluate("""
             () => {
