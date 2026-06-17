@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import argparse
 import logging
 import re
@@ -188,6 +189,7 @@ def get_max_page(page: Page) -> int:
         return 1
 
 
+# ── MODIFIED: collect_source with intelligent pagination ──────────────────
 def collect_source(
     page: Page,
     src: dict,
@@ -197,46 +199,59 @@ def collect_source(
     """
     Scan one source section across all its listing pages.
 
-    BUG-FIX 2 (full):  The original code used /page/N URL injection on a SPA
-    whose Vue router hadn't mounted yet → identical page content → one-page loop.
-    Fix: load page 1 first with networkidle wait (Vue mounts & renders listing),
-    then read the actual pagination links from the DOM to get the real page count,
-    then navigate each page URL in sequence.  The Vue router IS already initialised
-    from page 1 so /page/N navigations work correctly.
+    MODIFIED: Now continues pagination until we explicitly see an article
+    older than the target month, or until we exhaust all pages. Also handles
+    empty pages gracefully.
     """
     all_items: dict[str, dict] = {}
     base_url = src["url"].rstrip("/")
     source_name = src["name"]
 
+    # Load page 1 first to initialise Vue
     log.info(f"  Loading page 1: {base_url}")
     if not navigate_and_wait(page, base_url):
         return {}
 
-    # Read total pages from rendered DOM (only available after Vue mounts)
+    # Get initial max page (may be updated later)
     max_page = get_max_page(page)
-    log.info(f"  Detected {max_page} listing page(s)")
+    log.info(f"  Detected initial max page: {max_page}")
 
-    for page_num in range(1, max_page + 1):
+    page_num = 1
+    empty_page_count = 0   # consecutive empty pages
+    found_older = False
+
+    while page_num <= MAX_PAGES:
+        # Navigate to the current page (if not page 1)
         if page_num > 1:
             page_url = f"{base_url}/page/{page_num}"
             log.info(f"  Loading page {page_num}: {page_url}")
             if not navigate_and_wait(page, page_url):
                 break
-
-            # Detect SPA redirect-to-page-1 (Vue ignores bad page numbers)
-            cur_url = page.url
-            if page_num > 1 and not f"/page/{page_num}" in cur_url:
-                log.info(f"  Redirected away from page {page_num} — stopping")
+            # Verify that we actually landed on /page/N (avoid SPA fallback)
+            if f"/page/{page_num}" not in page.url:
+                log.info(f"  Page {page_num} not found (URL unchanged), stopping")
                 break
+        else:
+            # Page 1 already loaded
+            pass
 
+        # Extract articles from current page
         articles = extract_page_articles(page)
+
         if not articles:
-            log.info(f"  Page {page_num}: no articles found — stopping")
-            break
+            empty_page_count += 1
+            log.info(f"  Page {page_num}: no articles extracted (empty count {empty_page_count})")
+            # If two consecutive empty pages and not page 1, assume end of content
+            if empty_page_count >= 2 and page_num > 1:
+                log.info("  Two consecutive empty pages → stopping")
+                break
+            page_num += 1
+            continue
+        else:
+            empty_page_count = 0   # reset
 
-        added        = 0
-        found_older  = False
-
+        # Process articles: collect target month and check for older
+        added = 0
         for item in articles:
             ds = item.get("date_str", "")
             if len(ds) < 10:
@@ -248,6 +263,7 @@ def collect_source(
 
             if (ly, lm) < (year, month):
                 found_older = True
+                # Keep processing to also collect target month entries on same page
             elif (ly, lm) == (year, month):
                 url = item["url"]
                 if url not in all_items:
@@ -256,15 +272,26 @@ def collect_source(
 
         log.info(
             f"  Page {page_num}: {len(articles)} articles, "
-            f"+{added} matched {year}-{month:02d}"
-            + (" [older found → stop]" if found_older else "")
+            f"+{added} matched {year}-{month:02d}, "
+            f"older_found={found_older}"
         )
 
-        # BUG-FIX 4: only stop AFTER finishing the current page, not mid-page.
-        # (Original code set stop_pagination on first old article, but the flag
-        # only took effect on the NEXT source page, which was fine. Kept same.)
+        # If we found an older article, we can stop (subsequent pages are even older)
         if found_older:
             break
+
+        # Update max_page dynamically (pagination links may appear later)
+        current_max = get_max_page(page)
+        if current_max > max_page:
+            max_page = current_max
+            log.info(f"  Updated max_page to {max_page}")
+
+        # Stop if we have reached the known last page
+        if page_num >= max_page:
+            log.info(f"  Reached max_page {max_page}, stopping")
+            break
+
+        page_num += 1
 
     return all_items
 
