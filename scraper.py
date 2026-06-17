@@ -5,12 +5,12 @@ import logging
 import re
 import time
 import hashlib
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from playwright.sync_api import Page, sync_playwright
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
+MAX_PDF_SIZE = 5 * 1024 * 1024  # 5 MB
 
 SOURCES = [
     {"name": "news",            "url": f"{BASE_URL}/zh/news"},
@@ -36,7 +37,7 @@ NAV_TIMEOUT   = 60_000   # ms
 RENDER_WAIT   = 5_000    # ms
 MAX_PAGES     = 50       # safety cap
 
-# ── Date regex (fixed) ────────────────────────────────────────────────────
+# ── Date & time regex ─────────────────────────────────────────────────────
 DATE_RE = re.compile(
     r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
@@ -44,8 +45,7 @@ DATE_RE = re.compile(
     r"[\s\-\/月\.]+"
     r"([12]\d|3[01]|0?[1-9])"     # day
 )
-
-_JS_DATE_RE = r"(20\d{{2}})[\s\-/年.]+(1[0-2]|0?[1-9])[\s\-/月.]+([12]\d|3[01]|0?[1-9])"
+TIME_RE = re.compile(r"([01]?\d|2[0-3]):([0-5]\d)")  # HH:MM
 
 
 def get_target_month() -> tuple[int, int]:
@@ -58,17 +58,28 @@ def sanitize_filename(name: str, max_len: int = 100) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name)[:max_len] or "Untitled"
 
 
-def parse_date_str(raw: str) -> Optional[str]:
-    m = DATE_RE.search(raw)
-    if not m:
+def parse_datetime(raw: str) -> Optional[str]:
+    """
+    Extract date and time from raw text.
+    Returns ISO-like string "YYYY-MM-DDTHH:MM" or None.
+    """
+    date_match = DATE_RE.search(raw)
+    if not date_match:
         return None
-    return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+    y, m, d = date_match.group(1), date_match.group(2).zfill(2), date_match.group(3).zfill(2)
+    time_match = TIME_RE.search(raw)
+    if time_match:
+        h, min = time_match.group(1).zfill(2), time_match.group(2).zfill(2)
+        return f"{y}-{m}-{d}T{h}:{min}"
+    else:
+        return f"{y}-{m}-{d}T00:00"
 
 
-# ── Core: extract article links ────────────────────────────────────────────
+# ── Core: extract article links with date & time ─────────────────────────
 _EXTRACT_JS = """
 () => {
     const DATE_RE = /(20\\d{2})[\\s\\-\\/年.]+(1[0-2]|0?[1-9])[\\s\\-\\/月.]+([12]\\d|3[01]|0?[1-9])/;
+    const TIME_RE = /([01]?\\d|2[0-3]):([0-5]\\d)/;
     const found = [];
     const seen  = new Set();
 
@@ -79,18 +90,35 @@ _EXTRACT_JS = """
         return '""" + BASE_URL + """/' + href;
     }
 
+    function extractDateTime(text) {
+        const dateMatch = text.match(DATE_RE);
+        if (!dateMatch) return null;
+        const y = dateMatch[1];
+        const m = dateMatch[2].padStart(2, '0');
+        const d = dateMatch[3].padStart(2, '0');
+        const timeMatch = text.match(TIME_RE);
+        let dt = y + '-' + m + '-' + d + 'T';
+        if (timeMatch) {
+            dt += timeMatch[1].padStart(2, '0') + ':' + timeMatch[2].padStart(2, '0');
+        } else {
+            dt += '00:00';
+        }
+        return dt;
+    }
+
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while (node = walker.nextNode()) {
         const text  = node.nodeValue.trim();
-        const match = text.match(DATE_RE);
-        if (!match) continue;
+        const dateMatch = text.match(DATE_RE);
+        if (!dateMatch) continue;
 
-        const dateStr = match[1] + '-'
-            + match[2].padStart(2, '0') + '-'
-            + match[3].padStart(2, '0');
-
+        // Get surrounding container to search for time and link
         let container = node.parentElement;
+        let fullText = container ? container.innerText : text;
+        const fullDate = extractDateTime(fullText) || extractDateTime(text);
+        if (!fullDate) continue;
+
         let links = [];
         for (let i = 0; i < 8; i++) {
             if (!container || container.tagName === 'BODY') break;
@@ -118,17 +146,21 @@ _EXTRACT_JS = """
             if (title.length < 3 && container)
                 title = (container.innerText || '').split('\\n')[0].trim();
 
-            found.push({ url, date_str: dateStr, text: title.substring(0, 80) });
+            found.push({ url, full_date: fullDate, text: title.substring(0, 80) });
         });
     }
 
+    // Holiday_weather: page itself is the article
     if (found.length === 0 && window.location.href.includes('Holiday_weather')) {
-        const m = document.body.innerText.match(DATE_RE);
-        if (m) found.push({
-            url:      window.location.href,
-            date_str: m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0'),
-            text:     document.title,
-        });
+        const fullText = document.body.innerText;
+        const fullDate = extractDateTime(fullText);
+        if (fullDate) {
+            found.push({
+                url:      window.location.href,
+                full_date: fullDate,
+                text:     document.title,
+            });
+        }
     }
     return found;
 }
@@ -141,7 +173,6 @@ _PAGINATION_JS = """
     const m = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+pages?/i);
     let maxPage = 1;
     if (m) maxPage = parseInt(m[1], 10);
-    // Also check page number links
     const links = Array.from(document.querySelectorAll('a[href*="page"]'));
     links.forEach(a => {
         const href = a.getAttribute('href');
@@ -182,16 +213,10 @@ def get_max_page(page: Page) -> int:
 
 
 def get_current_page(page: Page) -> int:
-    """Extract the current page number from pagination UI (highlighted)."""
     try:
-        # Look for active/current page number
         selectors = [
-            ".pagination .active",
-            ".pagination .current",
-            ".pager-current",
-            ".active a",
-            "li.active a",
-            "span.current",
+            ".pagination .active", ".pagination .current",
+            ".pager-current", ".active a", "li.active a", "span.current"
         ]
         for sel in selectors:
             elem = page.locator(sel)
@@ -199,30 +224,18 @@ def get_current_page(page: Page) -> int:
                 text = elem.inner_text().strip()
                 if text.isdigit():
                     return int(text)
-        # Try to find any number that is highlighted (e.g., bold or different color)
-        # Fallback: find the first number that is not a link? Or assume 1?
-        # We'll just return 1 if cannot determine.
         return 1
     except Exception:
         return 1
 
 
 def click_next_page(page: Page) -> bool:
-    """
-    Click the next page button or the next page number.
-    Returns True if clicked, False if no next page found.
-    """
-    # 1. Try explicit "next" button
+    # 1. Explicit "next" button
     next_selectors = [
-        "a:has-text('下一頁')",
-        "a:has-text('下一页')",
-        "a:has-text('Next')",
-        "a:has-text('>')",
-        "a.next",
-        "li.next a",
-        ".pagination .next a",
-        ".pager-next a",
-        "a[rel='next']",
+        "a:has-text('下一頁')", "a:has-text('下一页')",
+        "a:has-text('Next')", "a:has-text('>')",
+        "a.next", "li.next a", ".pagination .next a",
+        ".pager-next a", "a[rel='next']"
     ]
     for sel in next_selectors:
         try:
@@ -233,13 +246,10 @@ def click_next_page(page: Page) -> bool:
         except Exception:
             continue
 
-    # 2. Try to click the specific next page number (current + 1)
+    # 2. Click specific page number (current + 1)
     current = get_current_page(page)
     target = current + 1
-    # Look for a link containing the target number, but ensure it's not just part of a larger number
-    # Use exact text match or pattern
     try:
-        # Find all links with numbers
         links = page.locator("a").all()
         for link in links:
             text = link.inner_text().strip()
@@ -250,38 +260,32 @@ def click_next_page(page: Page) -> bool:
     except Exception:
         pass
 
-    # 3. Try to find any pagination link with a number greater than current, and pick the smallest
+    # 3. Find smallest number > current in pagination container
     try:
-        # Find all visible numbers in pagination container
         pagination = page.locator(".pagination, .pager, .page-nav, [class*='pagination'], [class*='pager']")
         if pagination.count():
             numbers = pagination.locator("a, span").all()
-            max_num = current
+            min_num = current
             target_el = None
             for el in numbers:
-                text = el.inner_text().strip()
-                if text.isdigit():
-                    num = int(text)
-                    if num > current and (target_el is None or num < max_num):
-                        max_num = num
+                txt = el.inner_text().strip()
+                if txt.isdigit():
+                    num = int(txt)
+                    if num > current and (target_el is None or num < min_num):
+                        min_num = num
                         target_el = el
             if target_el and target_el.is_visible() and target_el.is_enabled():
                 target_el.click()
                 return True
     except Exception:
         pass
-
-    # 4. If still not found, try to click on an element that contains "..." or similar (maybe ellipsis)
     return False
 
 
 def get_articles_hash(page: Page) -> str:
-    """Get a hash of the article list container to detect content changes."""
     try:
-        # We'll use the text content of all links that contain dates (or all a tags)
         text = page.evaluate("""
             () => {
-                // Try to find article items by common class names
                 const items = Array.from(document.querySelectorAll('.item, .news-item, .article, a'));
                 return items.map(el => el.innerText).join('|');
             }
@@ -291,7 +295,7 @@ def get_articles_hash(page: Page) -> str:
         return ""
 
 
-# ── MODIFIED: collect_source using click-based pagination ────────────────
+# ── Collect source (pagination via click) ─────────────────────────────────
 def collect_source(
     page: Page,
     src: dict,
@@ -314,7 +318,6 @@ def collect_source(
     found_older = False
 
     while page_num <= MAX_PAGES:
-        # Extract articles
         articles = extract_page_articles(page)
         if not articles:
             empty_page_count += 1
@@ -326,11 +329,13 @@ def collect_source(
             empty_page_count = 0
             added = 0
             for item in articles:
-                ds = item.get("date_str", "")
-                if len(ds) < 10:
+                full_date = item.get("full_date", "")
+                if len(full_date) < 10:
                     continue
+                # Compare year/month from full_date
                 try:
-                    ly, lm = int(ds[:4]), int(ds[5:7])
+                    dt = datetime.fromisoformat(full_date)
+                    ly, lm = dt.year, dt.month
                 except ValueError:
                     continue
 
@@ -339,7 +344,12 @@ def collect_source(
                 elif (ly, lm) == (year, month):
                     url = item["url"]
                     if url not in all_items:
-                        all_items[url] = {**item, "source": source_name}
+                        all_items[url] = {
+                            "url": url,
+                            "full_date": full_date,
+                            "text": item.get("text", ""),
+                            "source": source_name,
+                        }
                         added += 1
 
             log.info(
@@ -351,24 +361,17 @@ def collect_source(
             if found_older:
                 break
 
-        # Check if we've reached max_page
         if page_num >= max_page:
             log.info(f"  Reached max_page {max_page}, stopping")
             break
 
-        # Record current content hash before clicking
         before_hash = get_articles_hash(page)
-
-        # Click next page
         clicked = click_next_page(page)
         if not clicked:
             log.info("  No 'next page' button or number found, stopping")
             break
 
-        # Wait for content to update
-        page.wait_for_timeout(2_000)  # initial wait for Vue to react
-
-        # Wait until content hash changes (or timeout)
+        page.wait_for_timeout(2_000)
         try:
             page.wait_for_function(
                 f"() => {{ const h = '{get_articles_hash(page)}'; return h !== '{before_hash}'; }}",
@@ -383,8 +386,7 @@ def collect_source(
     return all_items
 
 
-# ── Article rendering ──────────────────────────────────────────────────────
-
+# ── Article rendering (with scale to reduce size) ─────────────────────────
 def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
     try:
         with page.context.expect_download(timeout=45_000) as dl:
@@ -398,12 +400,13 @@ def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
 
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
     safe = item["text"][:30].replace("/", "-")
-    dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['date_str']}_{safe}.pdf")
+    dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['full_date'].replace(':', '-')}_{safe}.pdf")
 
     try:
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2_000)
 
+        # Try embedded PDF first
         pdf_links: list[str] = page.evaluate(
             "() => Array.from(document.querySelectorAll('a[href$=\".pdf\"],a[href*=\"download\"]'))"
             ".map(a=>a.href)"
@@ -411,6 +414,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         if pdf_links and download_pdf_robust(pdf_links[0], dest, page):
             return dest
 
+        # Full-page print-to-PDF with scale 0.85 to reduce file size
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
         page.evaluate("""() => {
@@ -423,7 +427,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
             "@media print{body{-webkit-print-color-adjust:exact !important;"
             "print-color-adjust:exact !important}}"
         ))
-        page.pdf(path=str(dest), format="A4", print_background=True)
+        page.pdf(path=str(dest), format="A4", print_background=True, scale=0.85)
 
         if dest.exists() and dest.stat().st_size > 2_000:
             return dest
@@ -435,8 +439,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         return None
 
 
-# ── Entry point ────────────────────────────────────────────────────────────
-
+# ── Main ──────────────────────────────────────────────────────────────────
 def main(year: int, month: int) -> None:
     log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
 
@@ -466,12 +469,13 @@ def main(year: int, month: int) -> None:
             browser.close()
             return
 
-        sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
+        # Sort by full_date (ISO format, includes time)
+        sorted_items = sorted(all_items.values(), key=lambda x: x["full_date"])
         log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
 
         writer = PdfWriter()
         for i, item in enumerate(sorted_items, 1):
-            log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
+            log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['full_date']}] {item['text'][:50]}")
             pdf_path = process_article(page, item, tmp_dir, i)
             if pdf_path:
                 try:
@@ -481,7 +485,21 @@ def main(year: int, month: int) -> None:
 
         output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
-            writer.write(fh)
+            writer.write(fh, compress=True)  # ensure compression
+
+        # Check size and attempt further compression if > 5MB
+        size = output.stat().st_size
+        if size > MAX_PDF_SIZE:
+            log.info(f"PDF size {size/1_048_576:.2f} MB exceeds 5MB, applying additional compression...")
+            reader = PdfReader(output)
+            writer2 = PdfWriter()
+            for p in reader.pages:
+                p.compress_content_streams()  # compress page content
+                writer2.add_page(p)
+            with output.open("wb") as fh:
+                writer2.write(fh, compress=True)
+            new_size = output.stat().st_size
+            log.info(f"Compressed size: {new_size/1_048_576:.2f} MB")
 
         mb = output.stat().st_size / 1_048_576
         log.info(f"\n✅ Done: {output.name}  ({mb:.2f} MB)")
