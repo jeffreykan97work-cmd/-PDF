@@ -41,9 +41,9 @@ MAX_PAGES     = 50       # safety cap on pagination depth
 DATE_RE = re.compile(
     r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
-    r"(1[0-2]|0?[1-9])"           # month — two-digit first
+    r"(1[0-2]|0?[1-9])"            # month — two-digit first
     r"[\s\-\/月\.]+"
-    r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
+    r"([12]\d|3[01]|0?[1-9])"      # day   — two-digit first
 )
 
 # JS version (injected into browser) — no Python escaping needed for /regex/
@@ -436,12 +436,35 @@ def main(year: int, month: int) -> None:
                 except Exception as e:
                     log.warning(f"  Could not append {pdf_path.name}: {e}")
 
+        # ─── 新增：PDF 內容流與圖片壓縮邏輯 ───
+        log.info("\n🗜 開始壓縮 PDF 以控制在 5MB 以下...")
+        for page_obj in writer.pages:
+            # 1. 壓縮文字與向量圖形的內容流 (無損壓縮)
+            page_obj.compress_content_streams()
+            
+            # 2. 大幅降低頁面內所有圖片的品質 (需安裝 Pillow)
+            try:
+                for img in page_obj.images:
+                    try:
+                        # 將品質設為 25，能極大程度縮減因為截圖/網頁圖片造成的巨大體積
+                        img.replace(img.image, quality=25)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # ──────────────────────────────────────
+
         output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
         with output.open("wb") as fh:
             writer.write(fh)
 
         mb = output.stat().st_size / 1_048_576
         log.info(f"\n✅ Done: {output.name}  ({mb:.2f} MB)")
+        
+        # 溫馨提醒
+        if mb > 5.0:
+            log.warning("⚠️ 檔案壓縮後仍超過 5MB。若需更強力的壓縮，建議後續使用 Ghostscript 處理。")
+
         browser.close()
 
 
