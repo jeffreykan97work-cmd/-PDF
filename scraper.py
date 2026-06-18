@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import subprocess
 import time
 from datetime import date
 from pathlib import Path
@@ -34,6 +35,19 @@ NAV_TIMEOUT   = 60_000   # ms — page navigation
 RENDER_WAIT   = 5_000    # ms — after navigation, wait for Vue to render data
 MAX_PAGES     = 50       # safety cap on pagination depth
 
+# ── Compression ────────────────────────────────────────────────────────────
+PDF_SIZE_LIMIT = 5 * 1024 * 1024   # 5 MB hard limit
+
+# Each entry: (gs_setting, image_dpi).  Tried in order until size ≤ limit.
+# /ebook (150 dpi) — good quality for text + images, readable on screen.
+# /screen (96 dpi) — smaller; still legible for news articles.
+# /screen (72 dpi) — minimum; last resort.
+_COMPRESS_ATTEMPTS = [
+    ("ebook",  150),
+    ("screen",  96),
+    ("screen",  72),
+]
+
 # ── BUG-FIX 1: Date regex ──────────────────────────────────────────────────
 # Original alternation (0?[1-9]|[12]\d|3[01]) matches only the first digit of
 # two-digit values like "20" because "0?" matches empty and "[1-9]" matches "2".
@@ -41,9 +55,9 @@ MAX_PAGES     = 50       # safety cap on pagination depth
 DATE_RE = re.compile(
     r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
-    r"(1[0-2]|0?[1-9])"            # month — two-digit first
+    r"(1[0-2]|0?[1-9])"           # month — two-digit first
     r"[\s\-\/月\.]+"
-    r"([12]\d|3[01]|0?[1-9])"      # day   — two-digit first
+    r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
 )
 
 # JS version (injected into browser) — no Python escaping needed for /regex/
@@ -392,6 +406,82 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         return None
 
 
+# ── PDF compression ────────────────────────────────────────────────────────
+
+def compress_pdf(input_path: Path, output_path: Path) -> bool:
+    """
+    Compress *input_path* with Ghostscript and write to *output_path*.
+    Tries progressively lower quality settings until the file is under
+    PDF_SIZE_LIMIT.  Returns True if the target was met.
+
+    Ghostscript is already installed in the GitHub Actions workflow via:
+        sudo apt-get install -y ghostscript
+    """
+    input_size = input_path.stat().st_size
+    input_mb   = input_size / 1_048_576
+
+    if input_size <= PDF_SIZE_LIMIT:
+        log.info(f"  PDF is {input_mb:.2f} MB — already under 5 MB, skipping compression")
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return True
+
+    log.info(f"  PDF is {input_mb:.2f} MB — compressing…")
+
+    for gs_setting, img_dpi in _COMPRESS_ATTEMPTS:
+        cmd = [
+            "gs",
+            "-dBATCH", "-dNOPAUSE", "-dQUIET",
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.5",
+            f"-dPDFSETTINGS=/{gs_setting}",
+            # Downsample all image types to img_dpi
+            "-dDownsampleColorImages=true",
+            "-dDownsampleGrayImages=true",
+            "-dDownsampleMonoImages=true",
+            f"-dColorImageResolution={img_dpi}",
+            f"-dGrayImageResolution={img_dpi}",
+            f"-dMonoImageResolution={min(img_dpi * 2, 300)}",
+            # Compress embedded fonts and streams
+            "-dCompressFonts=true",
+            "-dEmbedAllFonts=true",
+            f"-sOutputFile={output_path}",
+            str(input_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                log.warning(f"  gs /{gs_setting} failed: {result.stderr[:200]}")
+                continue
+        except FileNotFoundError:
+            log.error("  Ghostscript (gs) not found — skipping compression")
+            import shutil
+            shutil.copy2(input_path, output_path)
+            return False
+        except subprocess.TimeoutExpired:
+            log.warning(f"  gs /{gs_setting} timed out")
+            continue
+
+        out_size = output_path.stat().st_size if output_path.exists() else 0
+        out_mb   = out_size / 1_048_576
+        log.info(f"  /{gs_setting} @{img_dpi}dpi → {out_mb:.2f} MB"
+                 + (" ✅" if out_size <= PDF_SIZE_LIMIT else " (still large)"))
+
+        if out_size <= PDF_SIZE_LIMIT:
+            return True
+
+    # All attempts done; keep best (last) result regardless
+    if output_path.exists() and output_path.stat().st_size > 0:
+        final_mb = output_path.stat().st_size / 1_048_576
+        log.warning(f"  ⚠️  Could not reach 5 MB target; final size: {final_mb:.2f} MB")
+        return False
+
+    # GS failed entirely — fall back to uncompressed
+    import shutil
+    shutil.copy2(input_path, output_path)
+    return False
+
+
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main(year: int, month: int) -> None:
@@ -436,34 +526,24 @@ def main(year: int, month: int) -> None:
                 except Exception as e:
                     log.warning(f"  Could not append {pdf_path.name}: {e}")
 
-        # ─── 新增：PDF 內容流與圖片壓縮邏輯 ───
-        log.info("\n🗜 開始壓縮 PDF 以控制在 5MB 以下...")
-        for page_obj in writer.pages:
-            # 1. 壓縮文字與向量圖形的內容流 (無損壓縮)
-            page_obj.compress_content_streams()
-            
-            # 2. 大幅降低頁面內所有圖片的品質 (需安裝 Pillow)
-            try:
-                for img in page_obj.images:
-                    try:
-                        # 將品質設為 25，能極大程度縮減因為截圖/網頁圖片造成的巨大體積
-                        img.replace(img.image, quality=25)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        # ──────────────────────────────────────
-
-        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
-        with output.open("wb") as fh:
+        # Write uncompressed merge first
+        raw_output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_raw.pdf")
+        with raw_output.open("wb") as fh:
             writer.write(fh)
 
-        mb = output.stat().st_size / 1_048_576
-        log.info(f"\n✅ Done: {output.name}  ({mb:.2f} MB)")
-        
-        # 溫馨提醒
-        if mb > 5.0:
-            log.warning("⚠️ 檔案壓縮後仍超過 5MB。若需更強力的壓縮，建議後續使用 Ghostscript 處理。")
+        raw_mb = raw_output.stat().st_size / 1_048_576
+        log.info(f"\n📄 Raw merged PDF: {raw_output.name}  ({raw_mb:.2f} MB)")
+
+        # Compress to final output
+        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
+        log.info(f"🗜  Compressing → {output.name} (target ≤ 5 MB)…")
+        compress_pdf(raw_output, output)
+
+        final_mb = output.stat().st_size / 1_048_576
+        log.info(f"\n✅ Done: {output.name}  ({final_mb:.2f} MB)")
+
+        # Clean up raw file (keep only the compressed final)
+        raw_output.unlink(missing_ok=True)
 
         browser.close()
 
