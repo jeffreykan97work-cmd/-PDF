@@ -139,32 +139,98 @@ _EXTRACT_JS = """
 }
 """
 
-# ── Pagination: find max page number from rendered DOM ────────────────────
-_PAGINATION_JS = """
+# ── Pagination helpers ─────────────────────────────────────────────────────
+
+# JS: return the max page number visible in the pagination bar.
+# Tries multiple selector patterns to cover different CMS themes.
+_MAX_PAGE_JS = """
 () => {
-    // Look for <a href="/zh/.../page/N"> links
-    const links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
-    let maxPage = 1;
-    links.forEach(a => {
-        const m = a.href.match(/\\/page\\/(\\d+)/);
-        if (m) maxPage = Math.max(maxPage, parseInt(m[1], 10));
+    let max = 1;
+
+    // Pattern A: numbered <a> or <button> inside a pagination container
+    // Covers Bootstrap .pagination, custom .page-list, etc.
+    const pgSelectors = [
+        '.pagination a', '.pagination button', '.pagination li a',
+        '.page-list a',  '.page-bar a',
+        '[class*="pagin"] a', '[class*="pagin"] button',
+        '[class*="page-num"]', '[class*="pageNum"]',
+    ];
+    pgSelectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => {
+            const n = parseInt((el.innerText || el.textContent || '').trim(), 10);
+            if (!isNaN(n) && n > max) max = n;
+        });
     });
 
-    // Also check text like "共 N 頁" / "Page N of M"
+    // Pattern B: text like "共 22 頁" / "Page 1 of 22"
     const bodyText = document.body.innerText;
-    const m2 = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+pages?/i);
-    if (m2) maxPage = Math.max(maxPage, parseInt(m2[1], 10));
+    const m = bodyText.match(/共\\s*(\\d+)\\s*頁/) ||
+              bodyText.match(/of\\s+(\\d+)\\s+page/i);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
 
-    return maxPage;
+    return max;
+}
+"""
+
+# JS: click the pagination button whose visible text exactly matches `pageNum`.
+# Returns true if the button was found and clicked, false otherwise.
+_CLICK_PAGE_JS = """
+(pageNum) => {
+    const label = String(pageNum);
+    const selectors = [
+        '.pagination a', '.pagination button', '.pagination li a', '.pagination li button',
+        '.page-list a',  '.page-bar a',
+        '[class*="pagin"] a', '[class*="pagin"] button',
+        '[class*="page-num"]', '[class*="pageNum"]',
+    ];
+    for (const sel of selectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            if ((el.innerText || el.textContent || '').trim() === label) {
+                el.click();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+"""
+
+# JS: grab a stable fingerprint of the current article listing so we can
+# detect when the Vue component has finished re-rendering after a page click.
+_ARTICLE_FINGERPRINT_JS = """
+() => {
+    // Use the text of the first few visible article titles / dates as a hash.
+    const texts = [];
+    document.querySelectorAll('a[href], [class*="title"], [class*="date"]').forEach(el => {
+        const t = (el.innerText || '').trim();
+        if (t.length > 5) texts.push(t);
+        if (texts.length >= 10) return;
+    });
+    return texts.join('|');
 }
 """
 
 
+def _wait_for_content_change(page: Page, old_fingerprint: str, timeout_ms: int = 10_000) -> bool:
+    """
+    Poll until the article listing DOM changes from old_fingerprint.
+    Returns True when changed, False on timeout.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            new_fp = page.evaluate(_ARTICLE_FINGERPRINT_JS)
+            if new_fp and new_fp != old_fingerprint:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
 def navigate_and_wait(page: Page, url: str) -> bool:
-    """Navigate to url, wait for Vue to render. Returns True on success."""
+    """Navigate to url with networkidle wait so Vue renders its article list."""
     try:
-        # BUG-FIX 2 (key): use "networkidle" so Vue has time to fetch & render
-        # its article list before we try to read the DOM.
         page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(RENDER_WAIT)
         return True
@@ -181,13 +247,6 @@ def extract_page_articles(page: Page) -> list[dict]:
         return []
 
 
-def get_max_page(page: Page) -> int:
-    try:
-        return max(1, int(page.evaluate(_PAGINATION_JS)))
-    except Exception:
-        return 1
-
-
 def collect_source(
     page: Page,
     src: dict,
@@ -195,47 +254,59 @@ def collect_source(
     month: int,
 ) -> dict[str, dict]:
     """
-    Scan one source section across all its listing pages.
+    Scan one source section across all its paginated listing pages.
 
-    BUG-FIX 2 (full):  The original code used /page/N URL injection on a SPA
-    whose Vue router hadn't mounted yet → identical page content → one-page loop.
-    Fix: load page 1 first with networkidle wait (Vue mounts & renders listing),
-    then read the actual pagination links from the DOM to get the real page count,
-    then navigate each page URL in sequence.  The Vue router IS already initialised
-    from page 1 so /page/N navigations work correctly.
+    CONFIRMED behaviour (from screenshot): the SMG SPA changes article content
+    when a page number button is clicked, but the browser URL never changes.
+    URL-based navigation to /page/N therefore does NOT work.
+
+    Fix: load page 1, detect the total page count from the rendered pagination
+    bar, then click each numbered button in sequence and wait for the article
+    list to re-render before extracting.
     """
     all_items: dict[str, dict] = {}
-    base_url = src["url"].rstrip("/")
     source_name = src["name"]
+    base_url = src["url"].rstrip("/")
 
-    log.info(f"  Loading page 1: {base_url}")
+    log.info(f"  Loading: {base_url}")
     if not navigate_and_wait(page, base_url):
         return {}
 
-    # Read total pages from rendered DOM (only available after Vue mounts)
-    max_page = get_max_page(page)
-    log.info(f"  Detected {max_page} listing page(s)")
+    # Detect total pages from the now-rendered pagination bar
+    try:
+        max_page = max(1, int(page.evaluate(_MAX_PAGE_JS)))
+    except Exception:
+        max_page = 1
+    log.info(f"  Pagination: {max_page} page(s) detected")
 
-    for page_num in range(1, max_page + 1):
+    for page_num in range(1, min(max_page, MAX_PAGES) + 1):
+
+        # ── Click the page-number button for pages 2+ ──────────────────────
         if page_num > 1:
-            page_url = f"{base_url}/page/{page_num}"
-            log.info(f"  Loading page {page_num}: {page_url}")
-            if not navigate_and_wait(page, page_url):
+            old_fp = page.evaluate(_ARTICLE_FINGERPRINT_JS)
+            clicked = page.evaluate(_CLICK_PAGE_JS, page_num)
+
+            if not clicked:
+                log.warning(f"  Could not find page-{page_num} button — stopping")
                 break
 
-            # Detect SPA redirect-to-page-1 (Vue ignores bad page numbers)
-            cur_url = page.url
-            if page_num > 1 and not f"/page/{page_num}" in cur_url:
-                log.info(f"  Redirected away from page {page_num} — stopping")
+            # Wait for Vue to fetch and re-render the new article list
+            changed = _wait_for_content_change(page, old_fp, timeout_ms=12_000)
+            if not changed:
+                log.warning(f"  Content did not change after clicking page {page_num} — stopping")
                 break
 
+            # Extra settle time for images / lazy elements
+            page.wait_for_load_state("networkidle", timeout=15_000)
+
+        # ── Extract articles from the current (rendered) listing ───────────
         articles = extract_page_articles(page)
         if not articles:
             log.info(f"  Page {page_num}: no articles found — stopping")
             break
 
-        added        = 0
-        found_older  = False
+        added       = 0
+        found_older = False
 
         for item in articles:
             ds = item.get("date_str", "")
@@ -255,14 +326,11 @@ def collect_source(
                     added += 1
 
         log.info(
-            f"  Page {page_num}: {len(articles)} articles, "
+            f"  Page {page_num}/{max_page}: {len(articles)} articles, "
             f"+{added} matched {year}-{month:02d}"
             + (" [older found → stop]" if found_older else "")
         )
 
-        # BUG-FIX 4: only stop AFTER finishing the current page, not mid-page.
-        # (Original code set stop_pagination on first old article, but the flag
-        # only took effect on the NEXT source page, which was fine. Kept same.)
         if found_older:
             break
 
