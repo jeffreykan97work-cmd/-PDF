@@ -39,7 +39,7 @@ jobs:
       - name: Install Playwright Chromium browser
         run: playwright install chromium --with-deps
 
-      - name: Run scraper (single PDF: zh→pt→en by date)
+      - name: "Run scraper (single PDF: zh→pt→en by date)"
         run: |
           ARGS=""
           [[ -n "${{ github.event.inputs.year }}"  ]] && ARGS="$ARGS --year ${{ github.event.inputs.year }}"
