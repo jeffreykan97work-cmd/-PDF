@@ -17,7 +17,7 @@ on:
 jobs:
   generate-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # increased: now scrapes 3 languages
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -39,14 +39,14 @@ jobs:
       - name: Install Playwright Chromium browser
         run: playwright install chromium --with-deps
 
-      - name: Run scraper (zh + en + pt)
+      - name: Run scraper (single PDF: zh→pt→en by date)
         run: |
           ARGS=""
           [[ -n "${{ github.event.inputs.year }}"  ]] && ARGS="$ARGS --year ${{ github.event.inputs.year }}"
           [[ -n "${{ github.event.inputs.month }}" ]] && ARGS="$ARGS --month ${{ github.event.inputs.month }}"
           python scraper.py $ARGS
 
-      - name: Upload monthly report PDFs (all languages)
+      - name: Upload monthly report PDF
         uses: actions/upload-artifact@v4
         with:
           name: SMG-Monthly-Report

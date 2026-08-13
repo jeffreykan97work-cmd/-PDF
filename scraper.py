@@ -4,10 +4,12 @@ import logging
 import re
 import subprocess
 import time
-from datetime import date
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
+import requests
 from playwright.sync_api import Page, sync_playwright
 from pypdf import PdfWriter
 
@@ -21,42 +23,45 @@ log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
+CMS_BASE = "https://cms.smg.gov.mo"
 
-# Languages to scrape (zh = Chinese, en = English, pt = Portuguese)
-LANGUAGES = ["zh", "en", "pt"]
+# Frontend path segment → CMS API language code
+# Order within the same article: zh → pt → en (as requested)
+LANG_ORDER = ["zh", "pt", "en"]
+LANG_CMS = {
+    "zh": "zh_TW",
+    "en": "en",
+    "pt": "pt",
+}
+LANG_PRIORITY = {lang: i for i, lang in enumerate(LANG_ORDER)}  # zh=0, pt=1, en=2
 
-# Base path segments (language prefix is added dynamically)
-SOURCE_PATHS = [
-    {"name": "news",            "path": "news"},
-    {"name": "activity",        "path": "activity"},
-    {"name": "holiday_weather", "path": "news/Holiday_weather"},
-    {"name": "chat_info",       "path": "chat-info"},
-    {"name": "seasonal",        "path": "seasonal"},
-    {"name": "climate",         "path": "climate"},
+# CMS news category codes (from /api/newstype + seasonal)
+# activity page loads important + normal; news page loads news; etc.
+NEWS_CODES = [
+    "news",
+    "normal",           # 本局動態 / activity-related
+    "important",
+    "weather",          # 氣候資訊
+    "promote",
+    "Holiday_weather",  # Extra Info / holiday weather
+    "seasonal",
 ]
 
-NAV_TIMEOUT   = 60_000   # ms — page navigation
-RENDER_WAIT   = 5_000    # ms — after navigation, wait for Vue to render data
-MAX_PAGES     = 50       # safety cap on pagination depth
+NAV_TIMEOUT = 60_000
+RENDER_WAIT = 2_000
 
-# ── Compression ────────────────────────────────────────────────────────────
-PDF_SIZE_LIMIT = 5 * 1024 * 1024   # 5 MB hard limit
-
-# Each entry: (gs_setting, image_dpi).  Tried in order until size ≤ limit.
+PDF_SIZE_LIMIT = 5 * 1024 * 1024
 _COMPRESS_ATTEMPTS = [
-    ("ebook",  150),
-    ("screen",  96),
-    ("screen",  72),
+    ("ebook", 150),
+    ("screen", 96),
+    ("screen", 72),
 ]
 
-# ── Date regex (works for 2026-08-03, 2026/08/03, 2026年08月03日, etc.) ──
-DATE_RE = re.compile(
-    r"(20\d{2})"                   # year
-    r"[\s\-\/年\.]+"
-    r"(1[0-2]|0?[1-9])"           # month — two-digit first
-    r"[\s\-\/月\.]+"
-    r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
-)
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.0)",
+    "Accept": "application/json",
+})
 
 
 def get_target_month() -> tuple[int, int]:
@@ -69,275 +74,120 @@ def sanitize_filename(name: str, max_len: int = 100) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name)[:max_len] or "Untitled"
 
 
-def parse_date_str(raw: str) -> Optional[str]:
-    m = DATE_RE.search(raw)
-    if not m:
+def parse_startdate(raw: str) -> Optional[datetime]:
+    if not raw:
         return None
-    return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
-
-
-def build_sources(lang: str) -> list[dict]:
-    """Return SOURCES list for a given language code."""
-    return [
-        {
-            "name": f"{lang}_{s['name']}",
-            "url": f"{BASE_URL}/{lang}/{s['path']}",
-            "lang": lang,
-            "base_name": s["name"],
-        }
-        for s in SOURCE_PATHS
-    ]
-
-
-# ── Core: extract article links from current page DOM ─────────────────────
-_EXTRACT_JS = """
-() => {
-    const DATE_RE = /(20\\d{2})[\\s\\-\\/年.]+(1[0-2]|0?[1-9])[\\s\\-\\/月.]+([12]\\d|3[01]|0?[1-9])/;
-    const found = [];
-    const seen  = new Set();
-
-    function abs(href) {
-        if (!href) return null;
-        if (href.startsWith('http')) return href;
-        if (href.startsWith('/'))   return '""" + BASE_URL + """' + href;
-        return '""" + BASE_URL + """/' + href;
-    }
-
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while (node = walker.nextNode()) {
-        const text  = node.nodeValue.trim();
-        const match = text.match(DATE_RE);
-        if (!match) continue;
-
-        const dateStr = match[1] + '-'
-            + match[2].padStart(2, '0') + '-'
-            + match[3].padStart(2, '0');
-
-        let container = node.parentElement;
-        let links = [];
-        for (let i = 0; i < 8; i++) {
-            if (!container || container.tagName === 'BODY') break;
-            links = Array.from(container.querySelectorAll(
-                'a[href]:not([href="#"]):not([href^="javascript"]), [data-url], [onclick]'
-            ));
-            if (links.length > 0 && links.length <= 20) break;
-            container = container.parentElement;
-        }
-
-        links.forEach(el => {
-            let href = el.getAttribute('href') || el.getAttribute('data-url');
-            if (!href) {
-                const oc = el.getAttribute('onclick') || '';
-                const m2 = oc.match(/['"](\\/[^'"]+)['"]/);
-                if (m2) href = m2[1];
-            }
-            // Skip pagination links themselves
-            if (!href || /\\/page\\/\\d+/.test(href) || href.includes('?page=')) return;
-
-            const url = abs(href);
-            if (!url || seen.has(url)) return;
-            seen.add(url);
-
-            let title = (el.innerText || '').trim();
-            if (title.length < 3 && container)
-                title = (container.innerText || '').split('\\n')[0].trim();
-
-            found.push({ url, date_str: dateStr, text: title.substring(0, 80) });
-        });
-    }
-
-    // Holiday_weather: page itself is the article
-    if (found.length === 0 && window.location.href.includes('Holiday_weather')) {
-        const m = document.body.innerText.match(DATE_RE);
-        if (m) found.push({
-            url:      window.location.href,
-            date_str: m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0'),
-            text:     document.title,
-        });
-    }
-    return found;
-}
-"""
-
-# ── Pagination helpers ─────────────────────────────────────────────────────
-
-_MAX_PAGE_JS = """
-() => {
-    let max = 1;
-
-    const pgSelectors = [
-        '.pagination a', '.pagination button', '.pagination li a',
-        '.page-list a',  '.page-bar a',
-        '[class*="pagin"] a', '[class*="pagin"] button',
-        '[class*="page-num"]', '[class*="pageNum"]',
-    ];
-    pgSelectors.forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => {
-            const n = parseInt((el.innerText || el.textContent || '').trim(), 10);
-            if (!isNaN(n) && n > max) max = n;
-        });
-    });
-
-    // Multi-language total-page text patterns
-    const bodyText = document.body.innerText;
-    const patterns = [
-        /共\\s*(\\d+)\\s*頁/,                    // Chinese
-        /of\\s+(\\d+)\\s+page/i,               // English
-        /de\\s+(\\d+)\\s+p[aá]ginas?/i,        // Portuguese
-        /página\\s+(\\d+)\\s+de\\s+(\\d+)/i,    // Portuguese "página X de Y"
-        /page\\s+(\\d+)\\s+of\\s+(\\d+)/i,      // English "page X of Y"
-    ];
-    for (const re of patterns) {
-        const m = bodyText.match(re);
-        if (m) {
-            // Prefer the last capture group (total pages)
-            const n = parseInt(m[m.length - 1], 10);
-            if (!isNaN(n)) max = Math.max(max, n);
-        }
-    }
-
-    return max;
-}
-"""
-
-_CLICK_PAGE_JS = """
-(pageNum) => {
-    const label = String(pageNum);
-    const selectors = [
-        '.pagination a', '.pagination button', '.pagination li a', '.pagination li button',
-        '.page-list a',  '.page-bar a',
-        '[class*="pagin"] a', '[class*="pagin"] button',
-        '[class*="page-num"]', '[class*="pageNum"]',
-    ];
-    for (const sel of selectors) {
-        for (const el of document.querySelectorAll(sel)) {
-            if ((el.innerText || el.textContent || '').trim() === label) {
-                el.click();
-                return true;
-            }
-        }
-    }
-    return false;
-}
-"""
-
-_ARTICLE_FINGERPRINT_JS = """
-() => {
-    const texts = [];
-    document.querySelectorAll('a[href], [class*="title"], [class*="date"]').forEach(el => {
-        const t = (el.innerText || '').trim();
-        if (t.length > 5) texts.push(t);
-        if (texts.length >= 10) return;
-    });
-    return texts.join('|');
-}
-"""
-
-
-def _wait_for_content_change(page: Page, old_fingerprint: str, timeout_ms: int = 10_000) -> bool:
-    deadline = time.monotonic() + timeout_ms / 1000
-    while time.monotonic() < deadline:
+    raw = raw.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            new_fp = page.evaluate(_ARTICLE_FINGERPRINT_JS)
-            if new_fp and new_fp != old_fingerprint:
-                return True
-        except Exception:
-            pass
-        time.sleep(0.3)
-    return False
+            return datetime.strptime(raw[:19], fmt)
+        except ValueError:
+            continue
+    return None
 
 
-def navigate_and_wait(page: Page, url: str) -> bool:
+def fetch_cms_list(cms_lang: str, code: str) -> list[dict]:
+    url = f"{CMS_BASE}/{cms_lang}/api/news/{code}"
     try:
-        page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(RENDER_WAIT)
-        return True
+        r = SESSION.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return data["data"]
+        return []
     except Exception as e:
-        log.warning(f"  Navigation failed ({url}): {e}")
-        return False
-
-
-def extract_page_articles(page: Page) -> list[dict]:
-    try:
-        return page.evaluate(_EXTRACT_JS) or []
-    except Exception as e:
-        log.warning(f"  DOM extraction failed: {e}")
+        log.warning(f"  CMS fetch failed {cms_lang}/{code}: {e}")
         return []
 
 
-def collect_source(
-    page: Page,
-    src: dict,
-    year: int,
-    month: int,
-) -> dict[str, dict]:
-    all_items: dict[str, dict] = {}
-    source_name = src["name"]
-    base_url = src["url"].rstrip("/")
+def title_from_item(item: dict, cms_lang: str) -> str:
+    tr = item.get("translations") or {}
+    if isinstance(tr, dict):
+        # Prefer this language's title, fall back to any
+        block = tr.get(cms_lang) or next(iter(tr.values()), {}) or {}
+        t = (block.get("title") or "").strip()
+        if t:
+            return t
+    return (item.get("name") or f"article-{item.get('id')}").strip()
 
-    log.info(f"  Loading: {base_url}")
-    if not navigate_and_wait(page, base_url):
-        return {}
 
-    try:
-        max_page = max(1, int(page.evaluate(_MAX_PAGE_JS)))
-    except Exception:
-        max_page = 1
-    log.info(f"  Pagination: {max_page} page(s) detected")
+def collect_month_articles(year: int, month: int) -> list[dict]:
+    """
+    Collect articles for target month from all languages.
+    Returns a flat list of render items, already sorted:
+      1. by date ascending
+      2. same article (shared id): zh → pt → en
+    """
+    # id -> { lang -> item_meta }
+    groups: dict[int, dict[str, dict]] = defaultdict(dict)
+    group_dates: dict[int, datetime] = {}
 
-    for page_num in range(1, min(max_page, MAX_PAGES) + 1):
+    for fe_lang in LANG_ORDER:
+        cms_lang = LANG_CMS[fe_lang]
+        log.info(f"\n🌐 Fetching CMS lists for {fe_lang} ({cms_lang})")
+        seen_ids: set[int] = set()
 
-        if page_num > 1:
-            old_fp = page.evaluate(_ARTICLE_FINGERPRINT_JS)
-            clicked = page.evaluate(_CLICK_PAGE_JS, page_num)
+        for code in NEWS_CODES:
+            rows = fetch_cms_list(cms_lang, code)
+            matched = 0
+            for row in rows:
+                aid = row.get("id")
+                if aid is None:
+                    continue
+                try:
+                    aid = int(aid)
+                except (TypeError, ValueError):
+                    continue
+                if aid in seen_ids:
+                    continue
 
-            if not clicked:
-                log.warning(f"  Could not find page-{page_num} button — stopping")
-                break
+                dt = parse_startdate(str(row.get("startdate") or ""))
+                if not dt or dt.year != year or dt.month != month:
+                    continue
 
-            changed = _wait_for_content_change(page, old_fp, timeout_ms=12_000)
-            if not changed:
-                log.warning(f"  Content did not change after clicking page {page_num} — stopping")
-                break
+                # Need a real title in this language (skip empty translation shells)
+                title = title_from_item(row, cms_lang)
+                # en/pt lists sometimes include empty zh shells — skip if title empty
+                tr = row.get("translations") or {}
+                if isinstance(tr, dict):
+                    block = tr.get(cms_lang) or {}
+                    if not (block.get("title") or "").strip() and fe_lang != "zh":
+                        # still allow if any title exists for this lang key
+                        if not title or title.startswith("article-"):
+                            continue
 
-            page.wait_for_load_state("networkidle", timeout=15_000)
+                seen_ids.add(aid)
+                matched += 1
 
-        articles = extract_page_articles(page)
-        if not articles:
-            log.info(f"  Page {page_num}: no articles found — stopping")
-            break
+                groups[aid][fe_lang] = {
+                    "id": aid,
+                    "lang": fe_lang,
+                    "date_str": dt.strftime("%Y-%m-%d"),
+                    "datetime": dt,
+                    "text": title[:80],
+                    "url": f"{BASE_URL}/{fe_lang}/news/{aid}",
+                    "source": code,
+                }
+                # Prefer earliest known date for sorting the group
+                if aid not in group_dates or dt < group_dates[aid]:
+                    group_dates[aid] = dt
 
-        added       = 0
-        found_older = False
+            log.info(f"  {code}: {matched} in {year}-{month:02d} (total rows {len(rows)})")
 
-        for item in articles:
-            ds = item.get("date_str", "")
-            if len(ds) < 10:
-                continue
-            try:
-                ly, lm = int(ds[:4]), int(ds[5:7])
-            except ValueError:
-                continue
+    # Build ordered flat list
+    ordered_ids = sorted(groups.keys(), key=lambda i: (group_dates.get(i) or datetime.min, i))
+    flat: list[dict] = []
+    for aid in ordered_ids:
+        langs_present = groups[aid]
+        for fe_lang in LANG_ORDER:  # zh → pt → en
+            if fe_lang in langs_present:
+                flat.append(langs_present[fe_lang])
 
-            if (ly, lm) < (year, month):
-                found_older = True
-            elif (ly, lm) == (year, month):
-                url = item["url"]
-                if url not in all_items:
-                    all_items[url] = {**item, "source": source_name, "lang": src.get("lang", "")}
-                    added += 1
-
-        log.info(
-            f"  Page {page_num}/{max_page}: {len(articles)} articles, "
-            f"+{added} matched {year}-{month:02d}"
-            + (" [older found → stop]" if found_older else "")
-        )
-
-        if found_older:
-            break
-
-    return all_items
+    log.info(f"\n📦 Unique articles (by id): {len(ordered_ids)}")
+    log.info(f"📦 Total language variants to render: {len(flat)}")
+    return flat
 
 
 # ── Article rendering ──────────────────────────────────────────────────────
@@ -355,11 +205,13 @@ def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
 
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
     safe = item["text"][:30].replace("/", "-")
-    dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['date_str']}_{safe}.pdf")
+    dest = tmp_dir / sanitize_filename(
+        f"{seq:03d}_{item['date_str']}_{item['lang']}_{safe}.pdf"
+    )
 
     try:
         page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(2_000)
+        page.wait_for_timeout(RENDER_WAIT)
 
         # Try embedded PDF first
         pdf_links: list[str] = page.evaluate(
@@ -369,7 +221,6 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         if pdf_links and download_pdf_robust(pdf_links[0], dest, page):
             return dest
 
-        # Full-page print-to-PDF
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
         page.evaluate("""() => {
@@ -394,11 +245,9 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         return None
 
 
-# ── PDF compression ────────────────────────────────────────────────────────
-
 def compress_pdf(input_path: Path, output_path: Path) -> bool:
     input_size = input_path.stat().st_size
-    input_mb   = input_size / 1_048_576
+    input_mb = input_size / 1_048_576
 
     if input_size <= PDF_SIZE_LIMIT:
         log.info(f"  PDF is {input_mb:.2f} MB — already under 5 MB, skipping compression")
@@ -441,10 +290,11 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
             continue
 
         out_size = output_path.stat().st_size if output_path.exists() else 0
-        out_mb   = out_size / 1_048_576
-        log.info(f"  /{gs_setting} @{img_dpi}dpi → {out_mb:.2f} MB"
-                 + (" ✅" if out_size <= PDF_SIZE_LIMIT else " (still large)"))
-
+        out_mb = out_size / 1_048_576
+        log.info(
+            f"  /{gs_setting} @{img_dpi}dpi → {out_mb:.2f} MB"
+            + (" ✅" if out_size <= PDF_SIZE_LIMIT else " (still large)")
+        )
         if out_size <= PDF_SIZE_LIMIT:
             return True
 
@@ -458,111 +308,64 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
     return False
 
 
-# ── Generate one language report ───────────────────────────────────────────
-
-def generate_language_report(
-    page: Page,
-    lang: str,
-    year: int,
-    month: int,
-    base_tmp: Path,
-) -> Optional[Path]:
-    """Scrape one language and produce a compressed PDF. Returns path or None."""
-    log.info(f"\n{'='*60}")
-    log.info(f"🌐 Language: {lang.upper()}  |  Target: {year}-{month:02d}")
-    log.info(f"{'='*60}")
-
-    sources = build_sources(lang)
-    tmp_dir = base_tmp / lang
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    all_items: dict[str, dict] = {}
-
-    for src in sources:
-        log.info(f"\n📋 Source: {src['name']}")
-        items = collect_source(page, src, year, month)
-        before = len(all_items)
-        all_items.update(items)
-        log.info(f"  ✔ {src['name']}: {len(items)} found, "
-                 f"{len(all_items)-before} new unique")
-
-    if not all_items:
-        log.warning(f"❌ No articles found for {lang} {year}-{month:02d}. Skipping.")
-        return None
-
-    sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
-    log.info(f"\n📦 [{lang}] Total unique articles to render: {len(sorted_items)}")
-
-    writer = PdfWriter()
-    for i, item in enumerate(sorted_items, 1):
-        log.info(f"\n⚙  [{lang}] ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
-        pdf_path = process_article(page, item, tmp_dir, i)
-        if pdf_path:
-            try:
-                writer.append(str(pdf_path))
-            except Exception as e:
-                log.warning(f"  Could not append {pdf_path.name}: {e}")
-
-    if len(writer.pages) == 0:
-        log.warning(f"❌ [{lang}] No pages rendered. Skipping.")
-        return None
-
-    raw_output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_{lang}_raw.pdf")
-    with raw_output.open("wb") as fh:
-        writer.write(fh)
-
-    raw_mb = raw_output.stat().st_size / 1_048_576
-    log.info(f"\n📄 [{lang}] Raw merged PDF: {raw_output.name}  ({raw_mb:.2f} MB)")
-
-    output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_{lang}.pdf")
-    log.info(f"🗜  [{lang}] Compressing → {output.name} (target ≤ 5 MB)…")
-    compress_pdf(raw_output, output)
-
-    final_mb = output.stat().st_size / 1_048_576
-    log.info(f"\n✅ [{lang}] Done: {output.name}  ({final_mb:.2f} MB)")
-
-    raw_output.unlink(missing_ok=True)
-    return output
-
-
-# ── Entry point ────────────────────────────────────────────────────────────
-
 def main(year: int, month: int) -> None:
     log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
-    log.info(f"   Languages: {', '.join(LANGUAGES)}")
+    log.info("   Output: ONE PDF | order: date ASC, then zh → pt → en")
 
-    base_tmp = Path(f"smg_tmp_{year}_{month:02d}")
-    base_tmp.mkdir(exist_ok=True)
+    items = collect_month_articles(year, month)
+    if not items:
+        log.warning(f"❌ No articles found for {year}-{month:02d}. Exiting.")
+        return
 
-    produced: list[Path] = []
+    tmp_dir = Path(f"smg_tmp_{year}_{month:02d}")
+    tmp_dir.mkdir(exist_ok=True)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx  = browser.new_context(
+        ctx = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             accept_downloads=True,
         )
         page = ctx.new_page()
 
-        for lang in LANGUAGES:
-            result = generate_language_report(page, lang, year, month, base_tmp)
-            if result:
-                produced.append(result)
+        writer = PdfWriter()
+        for i, item in enumerate(items, 1):
+            log.info(
+                f"\n⚙  ({i}/{len(items)}) [{item['date_str']}] "
+                f"[{item['lang'].upper()}] {item['text'][:50]}"
+            )
+            pdf_path = process_article(page, item, tmp_dir, i)
+            if pdf_path:
+                try:
+                    writer.append(str(pdf_path))
+                except Exception as e:
+                    log.warning(f"  Could not append {pdf_path.name}: {e}")
 
+        if len(writer.pages) == 0:
+            log.warning("❌ No pages rendered. Exiting.")
+            browser.close()
+            return
+
+        raw_output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_raw.pdf")
+        with raw_output.open("wb") as fh:
+            writer.write(fh)
+
+        raw_mb = raw_output.stat().st_size / 1_048_576
+        log.info(f"\n📄 Raw merged PDF: {raw_output.name}  ({raw_mb:.2f} MB)")
+
+        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
+        log.info(f"🗜  Compressing → {output.name} (target ≤ 5 MB)…")
+        compress_pdf(raw_output, output)
+
+        final_mb = output.stat().st_size / 1_048_576
+        log.info(f"\n✅ Done: {output.name}  ({final_mb:.2f} MB)")
+        raw_output.unlink(missing_ok=True)
         browser.close()
-
-    if not produced:
-        log.warning(f"❌ No reports generated for {year}-{month:02d}.")
-        return
-
-    log.info(f"\n🎉 Finished. Produced {len(produced)} report(s):")
-    for p in produced:
-        log.info(f"   • {p.name}  ({p.stat().st_size / 1_048_576:.2f} MB)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--year",  type=int, default=get_target_month()[0])
+    parser.add_argument("--year", type=int, default=get_target_month()[0])
     parser.add_argument("--month", type=int, default=get_target_month()[1])
     args = parser.parse_args()
     main(args.year, args.month)
