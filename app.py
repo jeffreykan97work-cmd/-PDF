@@ -5,7 +5,6 @@ import re
 import shutil
 import subprocess
 import threading
-import time
 import sys
 import webbrowser
 from collections import defaultdict
@@ -18,14 +17,12 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 from playwright.sync_api import Page, sync_playwright
 from pypdf import PdfWriter
 
-# ── PyInstaller Playwright Path Configuration ────────────────────────────────
 if getattr(sys, 'frozen', False):
     bundle_dir = sys._MEIPASS
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(bundle_dir, 'ms-playwright')
 else:
     bundle_dir = os.path.dirname(os.path.abspath(__file__))
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 app_log_buffer: list[str] = []
 
 class WebLogHandler(logging.Handler):
@@ -39,17 +36,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 log.addHandler(WebLogHandler())
 
-# ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
 CMS_BASE = "https://cms.smg.gov.mo"
 
-LANG_ORDER = ["zh", "pt", "en"]  # 同一則：中文 → 葡文 → 英文
+LANG_ORDER = ["zh", "pt", "en"]
 LANG_CMS = {"zh": "zh_TW", "en": "en", "pt": "pt"}
 LANG_LABEL = {"zh": "中文", "pt": "Português", "en": "English"}
 
 NEWS_CODES = [
-    "news", "normal", "important", "weather", "promote", "Holiday_weather", "seasonal",
+    "news", "normal", "important", "weather", "promote",
+    "Holiday_weather", "seasonal", "question",
 ]
+SITECONTENT_CODES = ["chat-info"]  # 天氣「Fun」識
 
 NAV_TIMEOUT = 60_000
 RENDER_WAIT = 1_500
@@ -58,7 +56,7 @@ _COMPRESS_ATTEMPTS = [("ebook", 150), ("screen", 96), ("screen", 72)]
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.1)",
+    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.2)",
     "Accept": "application/json",
 })
 
@@ -84,8 +82,7 @@ def parse_startdate(raw: str) -> Optional[datetime]:
             continue
     return None
 
-def fetch_cms_list(cms_lang: str, code: str) -> list[dict]:
-    url = f"{CMS_BASE}/{cms_lang}/api/news/{code}"
+def fetch_cms_json(url: str) -> list[dict]:
     try:
         r = SESSION.get(url, timeout=30)
         r.raise_for_status()
@@ -96,7 +93,7 @@ def fetch_cms_list(cms_lang: str, code: str) -> list[dict]:
             return data["data"]
         return []
     except Exception as e:
-        log.warning(f"  CMS fetch failed {cms_lang}/{code}: {e}")
+        log.warning(f"  CMS fetch failed {url}: {e}")
         return []
 
 def extract_translation(item: dict, cms_lang: str) -> tuple[str, str]:
@@ -112,65 +109,75 @@ def extract_translation(item: dict, cms_lang: str) -> tuple[str, str]:
         title = (item.get("name") or "").strip()
     return title, content
 
+def _ingest_rows(rows, fe_lang, cms_lang, year, month, source, url_builder, groups, group_dates, seen_keys):
+    matched = 0
+    for row in rows:
+        aid = row.get("id")
+        if aid is None:
+            continue
+        try:
+            aid = int(aid)
+        except (TypeError, ValueError):
+            continue
+        gkey = f"{source}:{aid}"
+        if gkey in seen_keys:
+            continue
+        dt = parse_startdate(str(row.get("startdate") or ""))
+        if not dt or dt.year != year or dt.month != month:
+            continue
+        title, content = extract_translation(row, cms_lang)
+        if not title and not content:
+            continue
+        if not content and fe_lang != "zh":
+            if not title or title.startswith("article-"):
+                continue
+        seen_keys.add(gkey)
+        matched += 1
+        groups[gkey][fe_lang] = {
+            "id": aid, "gkey": gkey, "lang": fe_lang,
+            "date_str": dt.strftime("%Y-%m-%d"), "datetime": dt,
+            "title": title or f"article-{aid}", "content": content,
+            "url": url_builder(fe_lang, aid), "source": source,
+        }
+        if gkey not in group_dates or dt < group_dates[gkey]:
+            group_dates[gkey] = dt
+    return matched
+
 def collect_month_articles(year: int, month: int) -> list[dict]:
-    groups: dict[int, dict[str, dict]] = defaultdict(dict)
-    group_dates: dict[int, datetime] = {}
+    groups: dict[str, dict[str, dict]] = defaultdict(dict)
+    group_dates: dict[str, datetime] = {}
 
     for fe_lang in LANG_ORDER:
         cms_lang = LANG_CMS[fe_lang]
         log.info(f"\n🌐 Fetching CMS lists for {fe_lang} ({cms_lang})")
-        seen_ids: set[int] = set()
+        seen_keys: set[str] = set()
 
         for code in NEWS_CODES:
-            rows = fetch_cms_list(cms_lang, code)
-            matched = 0
-            for row in rows:
-                aid = row.get("id")
-                if aid is None:
-                    continue
-                try:
-                    aid = int(aid)
-                except (TypeError, ValueError):
-                    continue
-                if aid in seen_ids:
-                    continue
+            rows = fetch_cms_json(f"{CMS_BASE}/{cms_lang}/api/news/{code}")
+            matched = _ingest_rows(
+                rows, fe_lang, cms_lang, year, month, code,
+                lambda fl, aid: f"{BASE_URL}/{fl}/news/{aid}",
+                groups, group_dates, seen_keys,
+            )
+            log.info(f"  news/{code}: {matched} in {year}-{month:02d} (total {len(rows)})")
 
-                dt = parse_startdate(str(row.get("startdate") or ""))
-                if not dt or dt.year != year or dt.month != month:
-                    continue
+        for code in SITECONTENT_CODES:
+            rows = fetch_cms_json(f"{CMS_BASE}/{cms_lang}/api/sitecontent/{code}")
+            matched = _ingest_rows(
+                rows, fe_lang, cms_lang, year, month, f"sitecontent:{code}",
+                lambda fl, aid, c=code: f"{BASE_URL}/{fl}/{c}",
+                groups, group_dates, seen_keys,
+            )
+            log.info(f"  sitecontent/{code}: {matched} in {year}-{month:02d} (total {len(rows)})")
 
-                title, content = extract_translation(row, cms_lang)
-                if not title and not content:
-                    continue
-                if not content and fe_lang != "zh":
-                    if not title or title.startswith("article-"):
-                        continue
-
-                seen_ids.add(aid)
-                matched += 1
-                groups[aid][fe_lang] = {
-                    "id": aid,
-                    "lang": fe_lang,
-                    "date_str": dt.strftime("%Y-%m-%d"),
-                    "datetime": dt,
-                    "title": title or f"article-{aid}",
-                    "content": content,
-                    "url": f"{BASE_URL}/{fe_lang}/news/{aid}",
-                    "source": code,
-                }
-                if aid not in group_dates or dt < group_dates[aid]:
-                    group_dates[aid] = dt
-
-            log.info(f"  {code}: {matched} in {year}-{month:02d} (total rows {len(rows)})")
-
-    ordered_ids = sorted(groups.keys(), key=lambda i: (group_dates.get(i) or datetime.min, i))
+    ordered_keys = sorted(groups.keys(), key=lambda k: (group_dates.get(k) or datetime.min, k))
     flat: list[dict] = []
-    for aid in ordered_ids:
-        for fe_lang in LANG_ORDER:  # zh → pt → en
-            if fe_lang in groups[aid]:
-                flat.append(groups[aid][fe_lang])
+    for gkey in ordered_keys:
+        for fe_lang in LANG_ORDER:
+            if fe_lang in groups[gkey]:
+                flat.append(groups[gkey][fe_lang])
 
-    log.info(f"\n📦 Unique articles (by id): {len(ordered_ids)}")
+    log.info(f"\n📦 Unique articles: {len(ordered_keys)}")
     log.info(f"📦 Total language variants to render: {len(flat)}")
     return flat
 
@@ -181,79 +188,33 @@ def build_article_html(item: dict) -> str:
     date_str = item["date_str"]
     label = LANG_LABEL.get(lang, lang.upper())
     source_url = item.get("url", "")
+    source_tag = item.get("source", "")
 
-    content = re.sub(
-        r'(src|href)=(["\'])\/uploads\/',
-        rf'\1=\2{CMS_BASE}/uploads/',
-        content,
-    )
-    content = re.sub(
-        r'(src|href)=(["\'])\/\/',
-        r'\1=\2https://',
-        content,
-    )
+    content = re.sub(r'(src|href)=(["\'])\/uploads\/', rf'\1=\2{CMS_BASE}/uploads/', content)
+    content = re.sub(r'(src|href)=(["\'])\/\/', r'\1=\2https://', content)
 
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
   * {{ box-sizing: border-box; }}
   body {{
     font-family: "Noto Sans TC", "Noto Sans SC", "Microsoft YaHei",
-                 "PingFang TC", "PingFang SC", "Helvetica Neue",
-                 Arial, sans-serif;
-    font-size: 14px;
-    line-height: 1.7;
-    color: #222;
-    max-width: 800px;
-    margin: 0 auto;
-    padding: 24px 32px;
+                 "PingFang TC", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px; line-height: 1.7; color: #222;
+    max-width: 800px; margin: 0 auto; padding: 24px 32px;
   }}
-  .meta {{
-    font-size: 12px;
-    color: #666;
-    margin-bottom: 8px;
-    border-bottom: 1px solid #ddd;
-    padding-bottom: 8px;
-  }}
+  .meta {{ font-size: 12px; color: #666; margin-bottom: 8px; border-bottom: 1px solid #ddd; padding-bottom: 8px; }}
   .meta span {{ margin-right: 16px; }}
-  h1 {{
-    font-size: 20px;
-    font-weight: 700;
-    margin: 12px 0 20px;
-    line-height: 1.4;
-    color: #111;
-  }}
-  .body img {{
-    max-width: 100%;
-    height: auto;
-    display: block;
-    margin: 12px auto;
-  }}
+  h1 {{ font-size: 20px; font-weight: 700; margin: 12px 0 20px; line-height: 1.4; color: #111; }}
+  .body img {{ max-width: 100%; height: auto; display: block; margin: 12px auto; }}
   .body p {{ margin: 0 0 12px; }}
-  .body table {{
-    border-collapse: collapse;
-    width: 100%;
-    margin: 12px 0;
-  }}
-  .body th, .body td {{
-    border: 1px solid #ccc;
-    padding: 6px 8px;
-    text-align: left;
-  }}
-  .footer {{
-    margin-top: 28px;
-    padding-top: 10px;
-    border-top: 1px solid #eee;
-    font-size: 11px;
-    color: #999;
-  }}
-  @media print {{
-    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
-  }}
+  .body table {{ border-collapse: collapse; width: 100%; margin: 12px 0; }}
+  .body th, .body td {{ border: 1px solid #ccc; padding: 6px 8px; text-align: left; }}
+  .footer {{ margin-top: 28px; padding-top: 10px; border-top: 1px solid #eee; font-size: 11px; color: #999; }}
+  @media print {{ body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }} }}
 </style>
 </head>
 <body>
@@ -261,11 +222,10 @@ def build_article_html(item: dict) -> str:
     <span>📅 {date_str}</span>
     <span>🌐 {label}</span>
     <span>#{item['id']}</span>
+    <span>{source_tag}</span>
   </div>
   <h1>{title}</h1>
-  <div class="body">
-    {content if content else "<p><em>（此語言版本暫無正文內容）</em></p>"}
-  </div>
+  <div class="body">{content if content else "<p><em>（此語言版本暫無正文內容）</em></p>"}</div>
   <div class="footer">Source: {source_url}</div>
 </body>
 </html>"""
@@ -281,13 +241,8 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
             page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
-
-        page.pdf(
-            path=str(dest),
-            format="A4",
-            print_background=True,
-            margin={"top": "15mm", "bottom": "15mm", "left": "12mm", "right": "12mm"},
-        )
+        page.pdf(path=str(dest), format="A4", print_background=True,
+                 margin={"top": "15mm", "bottom": "15mm", "left": "12mm", "right": "12mm"})
         if dest.exists() and dest.stat().st_size > 1_000:
             return dest
         log.warning(f"  PDF too small, skipping: {dest.name}")
@@ -299,10 +254,9 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
 def compress_pdf(input_path: Path, output_path: Path) -> bool:
     input_size = input_path.stat().st_size
     if input_size <= PDF_SIZE_LIMIT:
-        log.info(f"  PDF is {input_size / 1_048_576:.2f} MB — already under limit, skipping compression")
+        log.info(f"  PDF is {input_size / 1_048_576:.2f} MB — already under limit")
         shutil.copy2(input_path, output_path)
         return True
-
     log.info(f"  PDF is {input_size / 1_048_576:.2f} MB — compressing…")
     for gs_setting, img_dpi in _COMPRESS_ATTEMPTS:
         cmd = [
@@ -320,19 +274,17 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
                 log.warning(f"  gs /{gs_setting} failed: {result.stderr[:200]}")
                 continue
         except FileNotFoundError:
-            log.warning("  Ghostscript (gs) not found — skipping compression")
+            log.warning("  Ghostscript not found — skipping compression")
             shutil.copy2(input_path, output_path)
             return False
         except subprocess.TimeoutExpired:
             log.warning(f"  gs /{gs_setting} timed out")
             continue
-
         out_size = output_path.stat().st_size if output_path.exists() else 0
         log.info(f"  /{gs_setting} @{img_dpi}dpi → {out_size / 1_048_576:.2f} MB"
                  + (" ✅" if out_size <= PDF_SIZE_LIMIT else " (still large)"))
         if out_size <= PDF_SIZE_LIMIT:
             return True
-
     if output_path.exists() and output_path.stat().st_size > 0:
         return False
     shutil.copy2(input_path, output_path)
@@ -345,7 +297,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             year, month = get_target_month()
         log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
         log.info("   Output: ONE PDF | order: date ASC, then zh → pt → en")
-        log.info("   Content source: CMS API (full body)")
+        log.info("   Sources: news/* + sitecontent/chat-info")
 
         current_dir = Path(os.getcwd())
         tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
@@ -368,7 +320,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                 log.info(
                     f"\n⚙  ({i}/{len(items)}) [{item['date_str']}] "
                     f"[{item['lang'].upper()}] {item['title'][:50]} "
-                    f"(body {content_len} chars)"
+                    f"(body {content_len} chars) [{item.get('source','')}]"
                 )
                 pdf_path = process_article(page, item, tmp_dir, i)
                 if pdf_path:
@@ -425,7 +377,7 @@ CONTROL_PANEL_UI_TEMPLATE = """
 <body>
 <div class="container">
     <h2>SMG Monthly PDF Scraper Console</h2>
-    <p style="color:#666;font-size:0.9em;">單一 PDF｜按日期排序｜同一則消息：中文 → 葡文 → 英文｜全文（非僅標題）</p>
+    <p style="color:#666;font-size:0.9em;">單一 PDF｜按日期排序｜中文→葡文→英文｜含新聞 + 天氣Fun識(chat-info)</p>
     <label>Target Year:</label> <input type="number" id="inputYear" placeholder="Leave blank for default (last month)">
     <label>Target Month:</label>
     <select id="inputMonth">
