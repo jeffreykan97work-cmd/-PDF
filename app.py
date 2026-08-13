@@ -43,42 +43,40 @@ log.addHandler(WebLogHandler())
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
 
-SOURCES = [
-    {"name": "news",            "url": f"{BASE_URL}/zh/news"},
-    {"name": "activity",        "url": f"{BASE_URL}/zh/activity"},
-    {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
-    {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
-    {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
-    {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
+LANGUAGES = ["zh", "en", "pt"]
+
+SOURCE_PATHS = [
+    {"name": "news",            "path": "news"},
+    {"name": "activity",        "path": "activity"},
+    {"name": "holiday_weather", "path": "news/Holiday_weather"},
+    {"name": "chat_info",       "path": "chat-info"},
+    {"name": "seasonal",        "path": "seasonal"},
+    {"name": "climate",         "path": "climate"},
 ]
 
-NAV_TIMEOUT   = 60_000   # ms — page navigation
-RENDER_WAIT   = 5_000    # ms — after navigation, wait for Vue to render data
-MAX_PAGES     = 50       # safety cap on pagination depth
+NAV_TIMEOUT   = 60_000
+RENDER_WAIT   = 5_000
+MAX_PAGES     = 50
 
-# ── Compression ────────────────────────────────────────────────────────────
-PDF_SIZE_LIMIT = 5 * 1024 * 1024   # 5 MB hard limit
+PDF_SIZE_LIMIT = 5 * 1024 * 1024
 _COMPRESS_ATTEMPTS = [
     ("ebook",  150),
     ("screen",  96),
     ("screen",  72),
 ]
 
-# ── Date Regex Fix ─────────────────────────────────────────────────────────
 DATE_RE = re.compile(
-    r"(20\d{2})"                   # year
+    r"(20\d{2})"
     r"[\s\-\/年\.]+"
-    r"(1[0-2]|0?[1-9])"            # month — two-digit first
+    r"(1[0-2]|0?[1-9])"
     r"[\s\-\/月\.]+"
-    r"([12]\d|3[01]|0?[1-9])"      # day   — two-digit first
+    r"([12]\d|3[01]|0?[1-9])"
 )
-_JS_DATE_RE = r"(20\d{{2}})[\s\-/年.]+(1[0-2]|0?[1-9])[\s\-/月.]+([12]\d|3[01]|0?[1-9])"
 
 # ── State Control Variables ────────────────────────────────────────────────
 scraper_running_status: bool = False
-scraper_execution_result: dict = {"success": False, "filename": "", "message": "Idle"}
+scraper_execution_result: dict = {"success": False, "filename": "", "message": "Idle", "files": []}
 
-# ── Helper Functions ───────────────────────────────────────────────────────
 def get_target_month() -> tuple[int, int]:
     today = date.today()
     return (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
@@ -91,6 +89,17 @@ def parse_date_str(raw: str) -> Optional[str]:
     m = DATE_RE.search(raw)
     if not m: return None
     return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+
+def build_sources(lang: str) -> list[dict]:
+    return [
+        {
+            "name": f"{lang}_{s['name']}",
+            "url": f"{BASE_URL}/{lang}/{s['path']}",
+            "lang": lang,
+            "base_name": s["name"],
+        }
+        for s in SOURCE_PATHS
+    ]
 
 # ── JS Injections ──────────────────────────────────────────────────────────
 _EXTRACT_JS = """
@@ -149,8 +158,20 @@ _MAX_PAGE_JS = """
     const pgSelectors = ['.pagination a', '.pagination button', '.pagination li a', '.page-list a', '.page-bar a', '[class*="pagin"] a', '[class*="pagin"] button', '[class*="page-num"]', '[class*="pageNum"]'];
     pgSelectors.forEach(sel => { document.querySelectorAll(sel).forEach(el => { const n = parseInt((el.innerText || el.textContent || '').trim(), 10); if (!isNaN(n) && n > max) max = n; }); });
     const bodyText = document.body.innerText;
-    const m = bodyText.match(/共\\s*(\\d+)\\s*頁/) || bodyText.match(/of\\s+(\\d+)\\s+page/i);
-    if (m) max = Math.max(max, parseInt(m[1], 10));
+    const patterns = [
+        /共\\s*(\\d+)\\s*頁/,
+        /of\\s+(\\d+)\\s+page/i,
+        /de\\s+(\\d+)\\s+p[aá]ginas?/i,
+        /página\\s+(\\d+)\\s+de\\s+(\\d+)/i,
+        /page\\s+(\\d+)\\s+of\\s+(\\d+)/i,
+    ];
+    for (const re of patterns) {
+        const m = bodyText.match(re);
+        if (m) {
+            const n = parseInt(m[m.length - 1], 10);
+            if (!isNaN(n)) max = Math.max(max, n);
+        }
+    }
     return max;
 }
 """
@@ -234,7 +255,7 @@ def collect_source(page: Page, src: dict, year: int, month: int) -> dict[str, di
             elif (ly, lm) == (year, month):
                 url = item["url"]
                 if url not in all_items:
-                    all_items[url] = {**item, "source": source_name}
+                    all_items[url] = {**item, "source": source_name, "lang": src.get("lang", "")}
                     added += 1
 
         log.info(f"  Page {page_num}/{max_page}: {len(articles)} articles, +{added} matched {year}-{month:02d}" + (" [older found → stop]" if found_older else ""))
@@ -305,64 +326,95 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
     if output_path.exists() and output_path.stat().st_size > 0: return False
     shutil.copy2(input_path, output_path); return False
 
+def generate_language_report(page: Page, lang: str, year: int, month: int, base_tmp: Path, current_dir: Path) -> Optional[str]:
+    log.info(f"\n{'='*60}")
+    log.info(f"🌐 Language: {lang.upper()}  |  Target: {year}-{month:02d}")
+    log.info(f"{'='*60}")
+
+    sources = build_sources(lang)
+    tmp_dir = base_tmp / lang
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    all_items: dict[str, dict] = {}
+
+    for src in sources:
+        log.info(f"\n📋 Source: {src['name']}")
+        items = collect_source(page, src, year, month)
+        before = len(all_items)
+        all_items.update(items)
+        log.info(f"  ✔ {src['name']}: {len(items)} found, {len(all_items)-before} new unique")
+
+    if not all_items:
+        log.warning(f"❌ No articles found for {lang} {year}-{month:02d}. Skipping.")
+        return None
+
+    sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
+    log.info(f"\n📦 [{lang}] Total unique articles to render: {len(sorted_items)}")
+
+    writer = PdfWriter()
+    for i, item in enumerate(sorted_items, 1):
+        log.info(f"\n⚙  [{lang}] ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
+        pdf_path = process_article(page, item, tmp_dir, i)
+        if pdf_path:
+            try: writer.append(str(pdf_path))
+            except Exception as e: log.warning(f"  Could not append {pdf_path.name}: {e}")
+
+    if len(writer.pages) == 0:
+        log.warning(f"❌ [{lang}] No pages rendered. Skipping.")
+        return None
+
+    raw_output = current_dir / f"SMG_Monthly_Report_{year}_{month:02d}_{lang}_raw.pdf"
+    with raw_output.open("wb") as fh: writer.write(fh)
+    log.info(f"\n📄 [{lang}] Raw merged PDF: {raw_output.name}  ({raw_output.stat().st_size / 1_048_576:.2f} MB)")
+
+    final_filename = f"SMG_Monthly_Report_{year}_{month:02d}_{lang}.pdf"
+    output = current_dir / final_filename
+    log.info(f"🗜  [{lang}] Compressing → {output.name} (target ≤ 5 MB)…")
+    compress_pdf(raw_output, output)
+    log.info(f"\n✅ [{lang}] Done: {output.name}  ({output.stat().st_size / 1_048_576:.2f} MB)")
+
+    raw_output.unlink(missing_ok=True)
+    return final_filename
+
 # ── Flask Worker Wrapper ───────────────────────────────────────────────────
 def execute_scraping_worker(year: Optional[int], month: Optional[int]):
     global scraper_running_status, scraper_execution_result
     try:
         if not year or not month: year, month = get_target_month()
         log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
+        log.info(f"   Languages: {', '.join(LANGUAGES)}")
         
         current_dir = Path(os.getcwd())
-        tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
-        tmp_dir.mkdir(exist_ok=True)
+        base_tmp = current_dir / f"smg_tmp_{year}_{month:02d}"
+        base_tmp.mkdir(exist_ok=True)
         
+        produced_files: list[str] = []
+
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, accept_downloads=True)
-            page, all_items = ctx.new_page(), {}
+            page = ctx.new_page()
             
-            for src in SOURCES:
-                log.info(f"\n📋 Source: {src['name']}")
-                items = collect_source(page, src, year, month)
-                before = len(all_items)
-                all_items.update(items)
-                log.info(f"  ✔ {src['name']}: {len(items)} found, {len(all_items)-before} new unique")
-                
-            if not all_items:
-                log.warning(f"❌ No articles found for {year}-{month:02d}. Exiting.")
-                scraper_execution_result = {"success": False, "filename": "", "message": "No matching articles found."}
-                browser.close()
-                return
+            for lang in LANGUAGES:
+                fname = generate_language_report(page, lang, year, month, base_tmp, current_dir)
+                if fname:
+                    produced_files.append(fname)
 
-            sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
-            log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
-            
-            writer = PdfWriter()
-            for i, item in enumerate(sorted_items, 1):
-                log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
-                pdf_path = process_article(page, item, tmp_dir, i)
-                if pdf_path:
-                    try: writer.append(str(pdf_path))
-                    except Exception as e: log.warning(f"  Could not append {pdf_path.name}: {e}")
-
-            raw_output = current_dir / f"SMG_Monthly_Report_{year}_{month:02d}_raw.pdf"
-            with raw_output.open("wb") as fh: writer.write(fh)
-            log.info(f"\n📄 Raw merged PDF: {raw_output.name}  ({raw_output.stat().st_size / 1_048_576:.2f} MB)")
-
-            final_filename = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
-            output = current_dir / final_filename
-            log.info(f"🗜  Compressing → {output.name} (target ≤ 5 MB)…")
-            compress_pdf(raw_output, output)
-            log.info(f"\n✅ Done: {output.name}  ({output.stat().st_size / 1_048_576:.2f} MB)")
-
-            raw_output.unlink(missing_ok=True)
             browser.close()
             
-        scraper_execution_result = {"success": True, "filename": final_filename, "message": "Report generated successfully!"}
+        if produced_files:
+            scraper_execution_result = {
+                "success": True,
+                "filename": produced_files[0],  # primary for backward compat
+                "files": produced_files,
+                "message": f"Generated {len(produced_files)} report(s): {', '.join(produced_files)}"
+            }
+        else:
+            scraper_execution_result = {"success": False, "filename": "", "files": [], "message": "No matching articles found for any language."}
         
     except Exception as e:
         log.error(f"❌ Execution error: {e}")
-        scraper_execution_result = {"success": False, "filename": "", "message": str(e)}
+        scraper_execution_result = {"success": False, "filename": "", "files": [], "message": str(e)}
     finally:
         scraper_running_status = False
 
@@ -379,11 +431,13 @@ CONTROL_PANEL_UI_TEMPLATE = """
         button { background: #3498db; color: #fff; border: none; cursor: pointer; font-weight: bold; }
         .console-box { background: #1e272e; color: #ced6e0; padding: 15px; height: 350px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; }
         .status-banner { padding: 12px; background: #f1f2f6; font-weight: bold; margin-bottom: 20px; }
+        .download-links a { display: inline-block; margin: 5px 8px 5px 0; background:#2ed573; color:#fff; padding:10px 14px; text-decoration:none; border-radius:4px; }
     </style>
 </head>
 <body>
 <div class="container">
     <h2>SMG Monthly PDF Scraper Console</h2>
+    <p style="color:#666;font-size:0.9em;">Now generates <b>Chinese (zh)</b> + <b>English (en)</b> + <b>Portuguese (pt)</b> reports.</p>
     <label>Target Year:</label> <input type="number" id="inputYear" placeholder="Leave blank for default (last month)">
     <label>Target Month:</label> 
     <select id="inputMonth">
@@ -395,7 +449,7 @@ CONTROL_PANEL_UI_TEMPLATE = """
     <button id="btnAction" onclick="triggerTask()">Launch Scraper Engine</button>
     <div id="statusBanner" class="status-banner">System Engine Status: Idle</div>
     <div id="downloadSection" style="display: none; padding:15px; background:#e8f4fd; margin-bottom:15px;">
-        <a id="linkDownload" href="#" style="background:#2ed573; color:#fff; padding:10px; text-decoration:none;">Download PDF Report</a>
+        <div class="download-links" id="downloadLinks"></div>
     </div>
     <div id="consoleLog" class="console-box">Waiting for process invocation...</div>
 </div>
@@ -405,9 +459,16 @@ CONTROL_PANEL_UI_TEMPLATE = """
         fetch('/engine-status').then(r=>r.json()).then(d=>{
             document.getElementById('statusBanner').innerText = d.running ? "Status: Running..." : "Status: " + d.result.message;
             document.getElementById('btnAction').disabled = d.running;
-            if(!d.running && d.result.filename) {
+            if(!d.running && d.result.files && d.result.files.length) {
                 document.getElementById('downloadSection').style.display = 'block';
-                document.getElementById('linkDownload').href = "/retrieve-file?file=" + encodeURIComponent(d.result.filename);
+                const box = document.getElementById('downloadLinks');
+                box.innerHTML = '';
+                d.result.files.forEach(f => {
+                    const a = document.createElement('a');
+                    a.href = "/retrieve-file?file=" + encodeURIComponent(f);
+                    a.textContent = "Download " + f;
+                    box.appendChild(a);
+                });
                 clearInterval(interval);
             }
         });
@@ -445,7 +506,7 @@ def trigger_execution_endpoint():
     if scraper_running_status: return jsonify({"status": "rejected"}), 400
     p = request.json or {}
     app_log_buffer.clear()
-    scraper_execution_result = {"success": False, "filename": "", "message": "Started"}
+    scraper_execution_result = {"success": False, "filename": "", "files": [], "message": "Started"}
     scraper_running_status = True
     threading.Thread(target=execute_scraping_worker, args=(int(p.get('year')) if p.get('year') else None, int(p.get('month')) if p.get('month') else None)).start()
     return jsonify({"status": "initiated"})
