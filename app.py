@@ -45,19 +45,20 @@ CMS_BASE = "https://cms.smg.gov.mo"
 
 LANG_ORDER = ["zh", "pt", "en"]  # 同一則：中文 → 葡文 → 英文
 LANG_CMS = {"zh": "zh_TW", "en": "en", "pt": "pt"}
+LANG_LABEL = {"zh": "中文", "pt": "Português", "en": "English"}
 
 NEWS_CODES = [
     "news", "normal", "important", "weather", "promote", "Holiday_weather", "seasonal",
 ]
 
 NAV_TIMEOUT = 60_000
-RENDER_WAIT = 2_000
+RENDER_WAIT = 1_500
 PDF_SIZE_LIMIT = 5 * 1024 * 1024
 _COMPRESS_ATTEMPTS = [("ebook", 150), ("screen", 96), ("screen", 72)]
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.1)",
     "Accept": "application/json",
 })
 
@@ -98,14 +99,18 @@ def fetch_cms_list(cms_lang: str, code: str) -> list[dict]:
         log.warning(f"  CMS fetch failed {cms_lang}/{code}: {e}")
         return []
 
-def title_from_item(item: dict, cms_lang: str) -> str:
+def extract_translation(item: dict, cms_lang: str) -> tuple[str, str]:
     tr = item.get("translations") or {}
+    block: dict = {}
     if isinstance(tr, dict):
-        block = tr.get(cms_lang) or next(iter(tr.values()), {}) or {}
-        t = (block.get("title") or "").strip()
-        if t:
-            return t
-    return (item.get("name") or f"article-{item.get('id')}").strip()
+        block = tr.get(cms_lang) or {}
+        if not isinstance(block, dict):
+            block = {}
+    title = (block.get("title") or "").strip()
+    content = (block.get("content") or "").strip()
+    if not title:
+        title = (item.get("name") or "").strip()
+    return title, content
 
 def collect_month_articles(year: int, month: int) -> list[dict]:
     groups: dict[int, dict[str, dict]] = defaultdict(dict)
@@ -134,13 +139,12 @@ def collect_month_articles(year: int, month: int) -> list[dict]:
                 if not dt or dt.year != year or dt.month != month:
                     continue
 
-                title = title_from_item(row, cms_lang)
-                tr = row.get("translations") or {}
-                if isinstance(tr, dict):
-                    block = tr.get(cms_lang) or {}
-                    if not (block.get("title") or "").strip() and fe_lang != "zh":
-                        if not title or title.startswith("article-"):
-                            continue
+                title, content = extract_translation(row, cms_lang)
+                if not title and not content:
+                    continue
+                if not content and fe_lang != "zh":
+                    if not title or title.startswith("article-"):
+                        continue
 
                 seen_ids.add(aid)
                 matched += 1
@@ -149,7 +153,8 @@ def collect_month_articles(year: int, month: int) -> list[dict]:
                     "lang": fe_lang,
                     "date_str": dt.strftime("%Y-%m-%d"),
                     "datetime": dt,
-                    "text": title[:80],
+                    "title": title or f"article-{aid}",
+                    "content": content,
                     "url": f"{BASE_URL}/{fe_lang}/news/{aid}",
                     "source": code,
                 }
@@ -169,47 +174,126 @@ def collect_month_articles(year: int, month: int) -> list[dict]:
     log.info(f"📦 Total language variants to render: {len(flat)}")
     return flat
 
-def download_pdf_robust(url: str, dest: Path, page: Page) -> bool:
-    try:
-        with page.context.expect_download(timeout=45_000) as dl:
-            page.evaluate(f"window.open('{url}', '_blank')")
-        dl.value.save_as(dest)
-        return dest.exists() and dest.stat().st_size > 2_000
-    except Exception as e:
-        log.warning(f"  PDF download failed ({url}): {e}")
-        return False
+def build_article_html(item: dict) -> str:
+    title = item["title"]
+    content = item.get("content") or ""
+    lang = item["lang"]
+    date_str = item["date_str"]
+    label = LANG_LABEL.get(lang, lang.upper())
+    source_url = item.get("url", "")
+
+    content = re.sub(
+        r'(src|href)=(["\'])\/uploads\/',
+        rf'\1=\2{CMS_BASE}/uploads/',
+        content,
+    )
+    content = re.sub(
+        r'(src|href)=(["\'])\/\/',
+        r'\1=\2https://',
+        content,
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="{lang}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: "Noto Sans TC", "Noto Sans SC", "Microsoft YaHei",
+                 "PingFang TC", "PingFang SC", "Helvetica Neue",
+                 Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.7;
+    color: #222;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 24px 32px;
+  }}
+  .meta {{
+    font-size: 12px;
+    color: #666;
+    margin-bottom: 8px;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 8px;
+  }}
+  .meta span {{ margin-right: 16px; }}
+  h1 {{
+    font-size: 20px;
+    font-weight: 700;
+    margin: 12px 0 20px;
+    line-height: 1.4;
+    color: #111;
+  }}
+  .body img {{
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 12px auto;
+  }}
+  .body p {{ margin: 0 0 12px; }}
+  .body table {{
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0;
+  }}
+  .body th, .body td {{
+    border: 1px solid #ccc;
+    padding: 6px 8px;
+    text-align: left;
+  }}
+  .footer {{
+    margin-top: 28px;
+    padding-top: 10px;
+    border-top: 1px solid #eee;
+    font-size: 11px;
+    color: #999;
+  }}
+  @media print {{
+    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="meta">
+    <span>📅 {date_str}</span>
+    <span>🌐 {label}</span>
+    <span>#{item['id']}</span>
+  </div>
+  <h1>{title}</h1>
+  <div class="body">
+    {content if content else "<p><em>（此語言版本暫無正文內容）</em></p>"}
+  </div>
+  <div class="footer">Source: {source_url}</div>
+</body>
+</html>"""
 
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
-    safe = item["text"][:30].replace("/", "-")
+    safe = (item["title"] or "untitled")[:30].replace("/", "-")
     dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['date_str']}_{item['lang']}_{safe}.pdf")
     try:
-        page.goto(item["url"], wait_until="networkidle", timeout=NAV_TIMEOUT)
+        html = build_article_html(item)
+        page.set_content(html, wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(RENDER_WAIT)
-        pdf_links = page.evaluate(
-            "() => Array.from(document.querySelectorAll('a[href$=\".pdf\"],a[href*=\"download\"]')).map(a=>a.href)"
-        )
-        if pdf_links and download_pdf_robust(pdf_links[0], dest, page):
-            return dest
+        try:
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
 
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1_000)
-        page.evaluate("""() => {
-            ['header','nav','footer','#header','#footer','#nav',
-             '.site-header','.breadcrumb','.cookie-bar','.back-to-top',
-             '.navbar-top','.sticky-header']
-            .forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
-        }""")
-        page.add_style_tag(content=(
-            "@media print{body{-webkit-print-color-adjust:exact !important;"
-            "print-color-adjust:exact !important}}"
-        ))
-        page.pdf(path=str(dest), format="A4", print_background=True)
-        if dest.exists() and dest.stat().st_size > 2_000:
+        page.pdf(
+            path=str(dest),
+            format="A4",
+            print_background=True,
+            margin={"top": "15mm", "bottom": "15mm", "left": "12mm", "right": "12mm"},
+        )
+        if dest.exists() and dest.stat().st_size > 1_000:
             return dest
         log.warning(f"  PDF too small, skipping: {dest.name}")
         return None
     except Exception as e:
-        log.warning(f"  Failed processing {item['url']}: {e}")
+        log.warning(f"  Failed processing id={item['id']} [{item['lang']}]: {e}")
         return None
 
 def compress_pdf(input_path: Path, output_path: Path) -> bool:
@@ -261,6 +345,7 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
             year, month = get_target_month()
         log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
         log.info("   Output: ONE PDF | order: date ASC, then zh → pt → en")
+        log.info("   Content source: CMS API (full body)")
 
         current_dir = Path(os.getcwd())
         tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
@@ -274,14 +359,16 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
 
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": 1920, "height": 1080}, accept_downloads=True)
+            ctx = browser.new_context(viewport={"width": 1200, "height": 1600}, accept_downloads=True)
             page = ctx.new_page()
 
             writer = PdfWriter()
             for i, item in enumerate(items, 1):
+                content_len = len(item.get("content") or "")
                 log.info(
                     f"\n⚙  ({i}/{len(items)}) [{item['date_str']}] "
-                    f"[{item['lang'].upper()}] {item['text'][:50]}"
+                    f"[{item['lang'].upper()}] {item['title'][:50]} "
+                    f"(body {content_len} chars)"
                 )
                 pdf_path = process_article(page, item, tmp_dir, i)
                 if pdf_path:
@@ -338,7 +425,7 @@ CONTROL_PANEL_UI_TEMPLATE = """
 <body>
 <div class="container">
     <h2>SMG Monthly PDF Scraper Console</h2>
-    <p style="color:#666;font-size:0.9em;">單一 PDF｜按日期排序｜同一則消息：中文 → 葡文 → 英文</p>
+    <p style="color:#666;font-size:0.9em;">單一 PDF｜按日期排序｜同一則消息：中文 → 葡文 → 英文｜全文（非僅標題）</p>
     <label>Target Year:</label> <input type="number" id="inputYear" placeholder="Leave blank for default (last month)">
     <label>Target Month:</label>
     <select id="inputMonth">
