@@ -3,7 +3,6 @@ import argparse
 import logging
 import re
 import subprocess
-import time
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
@@ -38,9 +37,8 @@ LANG_LABEL = {
     "pt": "Português",
     "en": "English",
 }
-LANG_PRIORITY = {lang: i for i, lang in enumerate(LANG_ORDER)}  # zh=0, pt=1, en=2
 
-# CMS news category codes
+# CMS news category codes (/api/news/{code})
 NEWS_CODES = [
     "news",
     "normal",           # 本局動態 / activity-related
@@ -49,6 +47,12 @@ NEWS_CODES = [
     "promote",
     "Holiday_weather",  # Extra Info / holiday weather
     "seasonal",
+    "question",         # 問題解說 Q&A
+]
+
+# CMS sitecontent codes (/api/sitecontent/{code}) — e.g. 天氣「Fun」識
+SITECONTENT_CODES = [
+    "chat-info",        # https://www.smg.gov.mo/{lang}/chat-info
 ]
 
 NAV_TIMEOUT = 60_000
@@ -63,7 +67,7 @@ _COMPRESS_ATTEMPTS = [
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.1)",
+    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.2)",
     "Accept": "application/json",
 })
 
@@ -90,8 +94,7 @@ def parse_startdate(raw: str) -> Optional[datetime]:
     return None
 
 
-def fetch_cms_list(cms_lang: str, code: str) -> list[dict]:
-    url = f"{CMS_BASE}/{cms_lang}/api/news/{code}"
+def fetch_cms_json(url: str) -> list[dict]:
     try:
         r = SESSION.get(url, timeout=30)
         r.raise_for_status()
@@ -102,8 +105,16 @@ def fetch_cms_list(cms_lang: str, code: str) -> list[dict]:
             return data["data"]
         return []
     except Exception as e:
-        log.warning(f"  CMS fetch failed {cms_lang}/{code}: {e}")
+        log.warning(f"  CMS fetch failed {url}: {e}")
         return []
+
+
+def fetch_news_list(cms_lang: str, code: str) -> list[dict]:
+    return fetch_cms_json(f"{CMS_BASE}/{cms_lang}/api/news/{code}")
+
+
+def fetch_sitecontent_list(cms_lang: str, code: str) -> list[dict]:
+    return fetch_cms_json(f"{CMS_BASE}/{cms_lang}/api/sitecontent/{code}")
 
 
 def extract_translation(item: dict, cms_lang: str) -> tuple[str, str]:
@@ -116,10 +127,68 @@ def extract_translation(item: dict, cms_lang: str) -> tuple[str, str]:
             block = {}
     title = (block.get("title") or "").strip()
     content = (block.get("content") or "").strip()
-    # Fallback: some shells put title on the root
     if not title:
         title = (item.get("name") or "").strip()
     return title, content
+
+
+def _ingest_rows(
+    rows: list[dict],
+    fe_lang: str,
+    cms_lang: str,
+    year: int,
+    month: int,
+    source: str,
+    url_builder,
+    groups: dict,
+    group_dates: dict,
+    seen_keys: set,
+) -> int:
+    """Filter rows for target month and merge into groups. Returns match count."""
+    matched = 0
+    for row in rows:
+        aid = row.get("id")
+        if aid is None:
+            continue
+        try:
+            aid = int(aid)
+        except (TypeError, ValueError):
+            continue
+
+        # Namespace key so news id and sitecontent id never collide
+        gkey = f"{source}:{aid}"
+        if gkey in seen_keys:
+            continue
+
+        dt = parse_startdate(str(row.get("startdate") or ""))
+        if not dt or dt.year != year or dt.month != month:
+            continue
+
+        title, content = extract_translation(row, cms_lang)
+        if not title and not content:
+            continue
+        if not content and fe_lang != "zh":
+            if not title or title.startswith("article-"):
+                continue
+
+        seen_keys.add(gkey)
+        matched += 1
+
+        groups[gkey][fe_lang] = {
+            "id": aid,
+            "gkey": gkey,
+            "lang": fe_lang,
+            "date_str": dt.strftime("%Y-%m-%d"),
+            "datetime": dt,
+            "title": title or f"article-{aid}",
+            "content": content,
+            "url": url_builder(fe_lang, aid),
+            "source": source,
+        }
+        if gkey not in group_dates or dt < group_dates[gkey]:
+            group_dates[gkey] = dt
+
+    return matched
 
 
 def collect_month_articles(year: int, month: int) -> list[dict]:
@@ -129,70 +198,47 @@ def collect_month_articles(year: int, month: int) -> list[dict]:
       1. by date ascending
       2. same article (shared id): zh → pt → en
     Each item carries full title + content HTML from CMS.
+    Sources: /api/news/* and /api/sitecontent/chat-info
     """
-    # id -> { lang -> item_meta }
-    groups: dict[int, dict[str, dict]] = defaultdict(dict)
-    group_dates: dict[int, datetime] = {}
+    groups: dict[str, dict[str, dict]] = defaultdict(dict)
+    group_dates: dict[str, datetime] = {}
 
     for fe_lang in LANG_ORDER:
         cms_lang = LANG_CMS[fe_lang]
         log.info(f"\n🌐 Fetching CMS lists for {fe_lang} ({cms_lang})")
-        seen_ids: set[int] = set()
+        seen_keys: set[str] = set()
 
+        # ── news categories ──
         for code in NEWS_CODES:
-            rows = fetch_cms_list(cms_lang, code)
-            matched = 0
-            for row in rows:
-                aid = row.get("id")
-                if aid is None:
-                    continue
-                try:
-                    aid = int(aid)
-                except (TypeError, ValueError):
-                    continue
-                if aid in seen_ids:
-                    continue
+            rows = fetch_news_list(cms_lang, code)
+            matched = _ingest_rows(
+                rows, fe_lang, cms_lang, year, month,
+                source=code,
+                url_builder=lambda fl, aid: f"{BASE_URL}/{fl}/news/{aid}",
+                groups=groups, group_dates=group_dates, seen_keys=seen_keys,
+            )
+            log.info(f"  news/{code}: {matched} in {year}-{month:02d} (total rows {len(rows)})")
 
-                dt = parse_startdate(str(row.get("startdate") or ""))
-                if not dt or dt.year != year or dt.month != month:
-                    continue
+        # ── sitecontent (天氣「Fun」識 etc.) ──
+        for code in SITECONTENT_CODES:
+            rows = fetch_sitecontent_list(cms_lang, code)
+            matched = _ingest_rows(
+                rows, fe_lang, cms_lang, year, month,
+                source=f"sitecontent:{code}",
+                url_builder=lambda fl, aid, c=code: f"{BASE_URL}/{fl}/{c}",
+                groups=groups, group_dates=group_dates, seen_keys=seen_keys,
+            )
+            log.info(f"  sitecontent/{code}: {matched} in {year}-{month:02d} (total rows {len(rows)})")
 
-                title, content = extract_translation(row, cms_lang)
-                # Skip empty translation shells (no real content for this language)
-                if not title and not content:
-                    continue
-                if not content and fe_lang != "zh":
-                    # Allow title-only for zh; for pt/en require body
-                    if not title or title.startswith("article-"):
-                        continue
-
-                seen_ids.add(aid)
-                matched += 1
-
-                groups[aid][fe_lang] = {
-                    "id": aid,
-                    "lang": fe_lang,
-                    "date_str": dt.strftime("%Y-%m-%d"),
-                    "datetime": dt,
-                    "title": title or f"article-{aid}",
-                    "content": content,  # full HTML body from CMS
-                    "url": f"{BASE_URL}/{fe_lang}/news/{aid}",
-                    "source": code,
-                }
-                if aid not in group_dates or dt < group_dates[aid]:
-                    group_dates[aid] = dt
-
-            log.info(f"  {code}: {matched} in {year}-{month:02d} (total rows {len(rows)})")
-
-    ordered_ids = sorted(groups.keys(), key=lambda i: (group_dates.get(i) or datetime.min, i))
+    ordered_keys = sorted(groups.keys(), key=lambda k: (group_dates.get(k) or datetime.min, k))
     flat: list[dict] = []
-    for aid in ordered_ids:
-        langs_present = groups[aid]
+    for gkey in ordered_keys:
+        langs_present = groups[gkey]
         for fe_lang in LANG_ORDER:  # zh → pt → en
             if fe_lang in langs_present:
                 flat.append(langs_present[fe_lang])
 
-    log.info(f"\n📦 Unique articles (by id): {len(ordered_ids)}")
+    log.info(f"\n📦 Unique articles: {len(ordered_keys)}")
     log.info(f"📦 Total language variants to render: {len(flat)}")
     return flat
 
@@ -207,8 +253,8 @@ def build_article_html(item: dict) -> str:
     date_str = item["date_str"]
     label = LANG_LABEL.get(lang, lang.upper())
     source_url = item.get("url", "")
+    source_tag = item.get("source", "")
 
-    # Ensure images/links that are protocol-relative or relative still work
     content = re.sub(
         r'(src|href)=(["\'])\/uploads\/',
         rf'\1=\2{CMS_BASE}/uploads/',
@@ -288,6 +334,7 @@ def build_article_html(item: dict) -> str:
     <span>📅 {date_str}</span>
     <span>🌐 {label}</span>
     <span>#{item['id']}</span>
+    <span>{source_tag}</span>
   </div>
   <h1>{title}</h1>
   <div class="body">
@@ -307,9 +354,7 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
     try:
         html = build_article_html(item)
         page.set_content(html, wait_until="networkidle", timeout=NAV_TIMEOUT)
-        # Give images a moment to load
         page.wait_for_timeout(RENDER_WAIT)
-        # Wait for images if any
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
@@ -398,7 +443,7 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
 def main(year: int, month: int) -> None:
     log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
     log.info("   Output: ONE PDF | order: date ASC, then zh → pt → en")
-    log.info("   Content source: CMS API (full body, not SPA title-only)")
+    log.info("   Sources: news/* + sitecontent/chat-info (天氣Fun識)")
 
     items = collect_month_articles(year, month)
     if not items:
@@ -422,7 +467,7 @@ def main(year: int, month: int) -> None:
             log.info(
                 f"\n⚙  ({i}/{len(items)}) [{item['date_str']}] "
                 f"[{item['lang'].upper()}] {item['title'][:50]} "
-                f"(body {content_len} chars)"
+                f"(body {content_len} chars) [{item.get('source','')}]"
             )
             pdf_path = process_article(page, item, tmp_dir, i)
             if pdf_path:
