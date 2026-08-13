@@ -22,13 +22,17 @@ log = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.smg.gov.mo"
 
-SOURCES = [
-    {"name": "news",            "url": f"{BASE_URL}/zh/news"},
-    {"name": "activity",        "url": f"{BASE_URL}/zh/activity"},
-    {"name": "holiday_weather", "url": f"{BASE_URL}/zh/news/Holiday_weather"},
-    {"name": "chat_info",       "url": f"{BASE_URL}/zh/chat-info"},
-    {"name": "seasonal",        "url": f"{BASE_URL}/zh/seasonal"},
-    {"name": "climate",         "url": f"{BASE_URL}/zh/climate"},
+# Languages to scrape (zh = Chinese, en = English, pt = Portuguese)
+LANGUAGES = ["zh", "en", "pt"]
+
+# Base path segments (language prefix is added dynamically)
+SOURCE_PATHS = [
+    {"name": "news",            "path": "news"},
+    {"name": "activity",        "path": "activity"},
+    {"name": "holiday_weather", "path": "news/Holiday_weather"},
+    {"name": "chat_info",       "path": "chat-info"},
+    {"name": "seasonal",        "path": "seasonal"},
+    {"name": "climate",         "path": "climate"},
 ]
 
 NAV_TIMEOUT   = 60_000   # ms — page navigation
@@ -39,19 +43,13 @@ MAX_PAGES     = 50       # safety cap on pagination depth
 PDF_SIZE_LIMIT = 5 * 1024 * 1024   # 5 MB hard limit
 
 # Each entry: (gs_setting, image_dpi).  Tried in order until size ≤ limit.
-# /ebook (150 dpi) — good quality for text + images, readable on screen.
-# /screen (96 dpi) — smaller; still legible for news articles.
-# /screen (72 dpi) — minimum; last resort.
 _COMPRESS_ATTEMPTS = [
     ("ebook",  150),
     ("screen",  96),
     ("screen",  72),
 ]
 
-# ── BUG-FIX 1: Date regex ──────────────────────────────────────────────────
-# Original alternation (0?[1-9]|[12]\d|3[01]) matches only the first digit of
-# two-digit values like "20" because "0?" matches empty and "[1-9]" matches "2".
-# Fix: put two-digit alternatives FIRST so they are tried before single-digit.
+# ── Date regex (works for 2026-08-03, 2026/08/03, 2026年08月03日, etc.) ──
 DATE_RE = re.compile(
     r"(20\d{2})"                   # year
     r"[\s\-\/年\.]+"
@@ -59,9 +57,6 @@ DATE_RE = re.compile(
     r"[\s\-\/月\.]+"
     r"([12]\d|3[01]|0?[1-9])"     # day   — two-digit first
 )
-
-# JS version (injected into browser) — no Python escaping needed for /regex/
-_JS_DATE_RE = r"(20\d{{2}})[\s\-/年.]+(1[0-2]|0?[1-9])[\s\-/月.]+([12]\d|3[01]|0?[1-9])"
 
 
 def get_target_month() -> tuple[int, int]:
@@ -79,6 +74,19 @@ def parse_date_str(raw: str) -> Optional[str]:
     if not m:
         return None
     return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+
+
+def build_sources(lang: str) -> list[dict]:
+    """Return SOURCES list for a given language code."""
+    return [
+        {
+            "name": f"{lang}_{s['name']}",
+            "url": f"{BASE_URL}/{lang}/{s['path']}",
+            "lang": lang,
+            "base_name": s["name"],
+        }
+        for s in SOURCE_PATHS
+    ]
 
 
 # ── Core: extract article links from current page DOM ─────────────────────
@@ -102,7 +110,6 @@ _EXTRACT_JS = """
         const match = text.match(DATE_RE);
         if (!match) continue;
 
-        // BUG-FIX: corrected group order — two-digit day captured properly
         const dateStr = match[1] + '-'
             + match[2].padStart(2, '0') + '-'
             + match[3].padStart(2, '0');
@@ -155,14 +162,10 @@ _EXTRACT_JS = """
 
 # ── Pagination helpers ─────────────────────────────────────────────────────
 
-# JS: return the max page number visible in the pagination bar.
-# Tries multiple selector patterns to cover different CMS themes.
 _MAX_PAGE_JS = """
 () => {
     let max = 1;
 
-    // Pattern A: numbered <a> or <button> inside a pagination container
-    // Covers Bootstrap .pagination, custom .page-list, etc.
     const pgSelectors = [
         '.pagination a', '.pagination button', '.pagination li a',
         '.page-list a',  '.page-bar a',
@@ -176,18 +179,28 @@ _MAX_PAGE_JS = """
         });
     });
 
-    // Pattern B: text like "共 22 頁" / "Page 1 of 22"
+    // Multi-language total-page text patterns
     const bodyText = document.body.innerText;
-    const m = bodyText.match(/共\\s*(\\d+)\\s*頁/) ||
-              bodyText.match(/of\\s+(\\d+)\\s+page/i);
-    if (m) max = Math.max(max, parseInt(m[1], 10));
+    const patterns = [
+        /共\\s*(\\d+)\\s*頁/,                    // Chinese
+        /of\\s+(\\d+)\\s+page/i,               // English
+        /de\\s+(\\d+)\\s+p[aá]ginas?/i,        // Portuguese
+        /página\\s+(\\d+)\\s+de\\s+(\\d+)/i,    // Portuguese "página X de Y"
+        /page\\s+(\\d+)\\s+of\\s+(\\d+)/i,      // English "page X of Y"
+    ];
+    for (const re of patterns) {
+        const m = bodyText.match(re);
+        if (m) {
+            // Prefer the last capture group (total pages)
+            const n = parseInt(m[m.length - 1], 10);
+            if (!isNaN(n)) max = Math.max(max, n);
+        }
+    }
 
     return max;
 }
 """
 
-# JS: click the pagination button whose visible text exactly matches `pageNum`.
-# Returns true if the button was found and clicked, false otherwise.
 _CLICK_PAGE_JS = """
 (pageNum) => {
     const label = String(pageNum);
@@ -209,11 +222,8 @@ _CLICK_PAGE_JS = """
 }
 """
 
-# JS: grab a stable fingerprint of the current article listing so we can
-# detect when the Vue component has finished re-rendering after a page click.
 _ARTICLE_FINGERPRINT_JS = """
 () => {
-    // Use the text of the first few visible article titles / dates as a hash.
     const texts = [];
     document.querySelectorAll('a[href], [class*="title"], [class*="date"]').forEach(el => {
         const t = (el.innerText || '').trim();
@@ -226,10 +236,6 @@ _ARTICLE_FINGERPRINT_JS = """
 
 
 def _wait_for_content_change(page: Page, old_fingerprint: str, timeout_ms: int = 10_000) -> bool:
-    """
-    Poll until the article listing DOM changes from old_fingerprint.
-    Returns True when changed, False on timeout.
-    """
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         try:
@@ -243,7 +249,6 @@ def _wait_for_content_change(page: Page, old_fingerprint: str, timeout_ms: int =
 
 
 def navigate_and_wait(page: Page, url: str) -> bool:
-    """Navigate to url with networkidle wait so Vue renders its article list."""
     try:
         page.goto(url, wait_until="networkidle", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(RENDER_WAIT)
@@ -267,17 +272,6 @@ def collect_source(
     year: int,
     month: int,
 ) -> dict[str, dict]:
-    """
-    Scan one source section across all its paginated listing pages.
-
-    CONFIRMED behaviour (from screenshot): the SMG SPA changes article content
-    when a page number button is clicked, but the browser URL never changes.
-    URL-based navigation to /page/N therefore does NOT work.
-
-    Fix: load page 1, detect the total page count from the rendered pagination
-    bar, then click each numbered button in sequence and wait for the article
-    list to re-render before extracting.
-    """
     all_items: dict[str, dict] = {}
     source_name = src["name"]
     base_url = src["url"].rstrip("/")
@@ -286,7 +280,6 @@ def collect_source(
     if not navigate_and_wait(page, base_url):
         return {}
 
-    # Detect total pages from the now-rendered pagination bar
     try:
         max_page = max(1, int(page.evaluate(_MAX_PAGE_JS)))
     except Exception:
@@ -295,7 +288,6 @@ def collect_source(
 
     for page_num in range(1, min(max_page, MAX_PAGES) + 1):
 
-        # ── Click the page-number button for pages 2+ ──────────────────────
         if page_num > 1:
             old_fp = page.evaluate(_ARTICLE_FINGERPRINT_JS)
             clicked = page.evaluate(_CLICK_PAGE_JS, page_num)
@@ -304,16 +296,13 @@ def collect_source(
                 log.warning(f"  Could not find page-{page_num} button — stopping")
                 break
 
-            # Wait for Vue to fetch and re-render the new article list
             changed = _wait_for_content_change(page, old_fp, timeout_ms=12_000)
             if not changed:
                 log.warning(f"  Content did not change after clicking page {page_num} — stopping")
                 break
 
-            # Extra settle time for images / lazy elements
             page.wait_for_load_state("networkidle", timeout=15_000)
 
-        # ── Extract articles from the current (rendered) listing ───────────
         articles = extract_page_articles(page)
         if not articles:
             log.info(f"  Page {page_num}: no articles found — stopping")
@@ -336,7 +325,7 @@ def collect_source(
             elif (ly, lm) == (year, month):
                 url = item["url"]
                 if url not in all_items:
-                    all_items[url] = {**item, "source": source_name}
+                    all_items[url] = {**item, "source": source_name, "lang": src.get("lang", "")}
                     added += 1
 
         log.info(
@@ -383,7 +372,6 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
         # Full-page print-to-PDF
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1_000)
-        # BUG-FIX 5: remove only known chrome elements, not generic .navbar
         page.evaluate("""() => {
             ['header','nav','footer','#header','#footer','#nav',
              '.site-header','.breadcrumb','.cookie-bar','.back-to-top',
@@ -409,14 +397,6 @@ def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional
 # ── PDF compression ────────────────────────────────────────────────────────
 
 def compress_pdf(input_path: Path, output_path: Path) -> bool:
-    """
-    Compress *input_path* with Ghostscript and write to *output_path*.
-    Tries progressively lower quality settings until the file is under
-    PDF_SIZE_LIMIT.  Returns True if the target was met.
-
-    Ghostscript is already installed in the GitHub Actions workflow via:
-        sudo apt-get install -y ghostscript
-    """
     input_size = input_path.stat().st_size
     input_mb   = input_size / 1_048_576
 
@@ -435,14 +415,12 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.5",
             f"-dPDFSETTINGS=/{gs_setting}",
-            # Downsample all image types to img_dpi
             "-dDownsampleColorImages=true",
             "-dDownsampleGrayImages=true",
             "-dDownsampleMonoImages=true",
             f"-dColorImageResolution={img_dpi}",
             f"-dGrayImageResolution={img_dpi}",
             f"-dMonoImageResolution={min(img_dpi * 2, 300)}",
-            # Compress embedded fonts and streams
             "-dCompressFonts=true",
             "-dEmbedAllFonts=true",
             f"-sOutputFile={output_path}",
@@ -470,25 +448,93 @@ def compress_pdf(input_path: Path, output_path: Path) -> bool:
         if out_size <= PDF_SIZE_LIMIT:
             return True
 
-    # All attempts done; keep best (last) result regardless
     if output_path.exists() and output_path.stat().st_size > 0:
         final_mb = output_path.stat().st_size / 1_048_576
         log.warning(f"  ⚠️  Could not reach 5 MB target; final size: {final_mb:.2f} MB")
         return False
 
-    # GS failed entirely — fall back to uncompressed
     import shutil
     shutil.copy2(input_path, output_path)
     return False
+
+
+# ── Generate one language report ───────────────────────────────────────────
+
+def generate_language_report(
+    page: Page,
+    lang: str,
+    year: int,
+    month: int,
+    base_tmp: Path,
+) -> Optional[Path]:
+    """Scrape one language and produce a compressed PDF. Returns path or None."""
+    log.info(f"\n{'='*60}")
+    log.info(f"🌐 Language: {lang.upper()}  |  Target: {year}-{month:02d}")
+    log.info(f"{'='*60}")
+
+    sources = build_sources(lang)
+    tmp_dir = base_tmp / lang
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    all_items: dict[str, dict] = {}
+
+    for src in sources:
+        log.info(f"\n📋 Source: {src['name']}")
+        items = collect_source(page, src, year, month)
+        before = len(all_items)
+        all_items.update(items)
+        log.info(f"  ✔ {src['name']}: {len(items)} found, "
+                 f"{len(all_items)-before} new unique")
+
+    if not all_items:
+        log.warning(f"❌ No articles found for {lang} {year}-{month:02d}. Skipping.")
+        return None
+
+    sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
+    log.info(f"\n📦 [{lang}] Total unique articles to render: {len(sorted_items)}")
+
+    writer = PdfWriter()
+    for i, item in enumerate(sorted_items, 1):
+        log.info(f"\n⚙  [{lang}] ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
+        pdf_path = process_article(page, item, tmp_dir, i)
+        if pdf_path:
+            try:
+                writer.append(str(pdf_path))
+            except Exception as e:
+                log.warning(f"  Could not append {pdf_path.name}: {e}")
+
+    if len(writer.pages) == 0:
+        log.warning(f"❌ [{lang}] No pages rendered. Skipping.")
+        return None
+
+    raw_output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_{lang}_raw.pdf")
+    with raw_output.open("wb") as fh:
+        writer.write(fh)
+
+    raw_mb = raw_output.stat().st_size / 1_048_576
+    log.info(f"\n📄 [{lang}] Raw merged PDF: {raw_output.name}  ({raw_mb:.2f} MB)")
+
+    output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_{lang}.pdf")
+    log.info(f"🗜  [{lang}] Compressing → {output.name} (target ≤ 5 MB)…")
+    compress_pdf(raw_output, output)
+
+    final_mb = output.stat().st_size / 1_048_576
+    log.info(f"\n✅ [{lang}] Done: {output.name}  ({final_mb:.2f} MB)")
+
+    raw_output.unlink(missing_ok=True)
+    return output
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main(year: int, month: int) -> None:
     log.info(f"🚀 SMG Monthly Scraper — Target: {year}-{month:02d}")
+    log.info(f"   Languages: {', '.join(LANGUAGES)}")
 
-    tmp_dir = Path(f"smg_tmp_{year}_{month:02d}")
-    tmp_dir.mkdir(exist_ok=True)
+    base_tmp = Path(f"smg_tmp_{year}_{month:02d}")
+    base_tmp.mkdir(exist_ok=True)
+
+    produced: list[Path] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -498,54 +544,20 @@ def main(year: int, month: int) -> None:
         )
         page = ctx.new_page()
 
-        all_items: dict[str, dict] = {}
-
-        for src in SOURCES:
-            log.info(f"\n📋 Source: {src['name']}")
-            items = collect_source(page, src, year, month)
-            before = len(all_items)
-            all_items.update(items)
-            log.info(f"  ✔ {src['name']}: {len(items)} found, "
-                     f"{len(all_items)-before} new unique")
-
-        if not all_items:
-            log.warning(f"❌ No articles found for {year}-{month:02d}. Exiting.")
-            browser.close()
-            return
-
-        sorted_items = sorted(all_items.values(), key=lambda x: x["date_str"])
-        log.info(f"\n📦 Total unique articles to render: {len(sorted_items)}")
-
-        writer = PdfWriter()
-        for i, item in enumerate(sorted_items, 1):
-            log.info(f"\n⚙  ({i}/{len(sorted_items)}) [{item['date_str']}] {item['text'][:50]}")
-            pdf_path = process_article(page, item, tmp_dir, i)
-            if pdf_path:
-                try:
-                    writer.append(str(pdf_path))
-                except Exception as e:
-                    log.warning(f"  Could not append {pdf_path.name}: {e}")
-
-        # Write uncompressed merge first
-        raw_output = Path(f"SMG_Monthly_Report_{year}_{month:02d}_raw.pdf")
-        with raw_output.open("wb") as fh:
-            writer.write(fh)
-
-        raw_mb = raw_output.stat().st_size / 1_048_576
-        log.info(f"\n📄 Raw merged PDF: {raw_output.name}  ({raw_mb:.2f} MB)")
-
-        # Compress to final output
-        output = Path(f"SMG_Monthly_Report_{year}_{month:02d}.pdf")
-        log.info(f"🗜  Compressing → {output.name} (target ≤ 5 MB)…")
-        compress_pdf(raw_output, output)
-
-        final_mb = output.stat().st_size / 1_048_576
-        log.info(f"\n✅ Done: {output.name}  ({final_mb:.2f} MB)")
-
-        # Clean up raw file (keep only the compressed final)
-        raw_output.unlink(missing_ok=True)
+        for lang in LANGUAGES:
+            result = generate_language_report(page, lang, year, month, base_tmp)
+            if result:
+                produced.append(result)
 
         browser.close()
+
+    if not produced:
+        log.warning(f"❌ No reports generated for {year}-{month:02d}.")
+        return
+
+    log.info(f"\n🎉 Finished. Produced {len(produced)} report(s):")
+    for p in produced:
+        log.info(f"   • {p.name}  ({p.stat().st_size / 1_048_576:.2f} MB)")
 
 
 if __name__ == "__main__":
