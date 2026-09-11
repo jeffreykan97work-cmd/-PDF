@@ -2,10 +2,13 @@ name: Build Windows EXE Package
 
 on:
   workflow_dispatch:
-    # Allows manual trigger from the GitHub Actions UI
+
+permissions:
+  contents: read
 
 jobs:
   build-windows-exe:
+    if: github.actor == 'jeffreykan97work-cmd'
     runs-on: windows-latest
     timeout-minutes: 30
 
