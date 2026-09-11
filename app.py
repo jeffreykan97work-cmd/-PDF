@@ -17,9 +17,9 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 from playwright.sync_api import Page, sync_playwright
 from pypdf import PdfWriter
 
-if getattr(sys, 'frozen', False):
+if getattr(sys, "frozen", False):
     bundle_dir = sys._MEIPASS
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(bundle_dir, 'ms-playwright')
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(bundle_dir, "ms-playwright")
 else:
     bundle_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -38,40 +38,16 @@ log.addHandler(WebLogHandler())
 
 BASE_URL = "https://www.smg.gov.mo"
 CMS_BASE = "https://cms.smg.gov.mo"
-
 LANG_ORDER = ["zh", "pt", "en"]
 LANG_CMS = {"zh": "zh_TW", "en": "en", "pt": "pt"}
-LANG_LABEL = {"zh": "中文", "pt": "Português", "en": "English"}
-
-SMG_HEADER_BG = f"{CMS_BASE}/uploads/image/5c62a3d6a7dca.jpg"
-SMG_LOGO = {
-    "zh": f"{BASE_URL}/assets/image/smg-logo-zh.png",
-    "en": f"{BASE_URL}/assets/image/smg-logo-en.png",
-    "pt": f"{BASE_URL}/assets/image/smg-logo-pt.png",
-}
-SMG_NAV = {
-    "zh": ["首頁", "天氣和氣候", "天氣警告", "空氣質量", "地球物理", "科普天地", "資源共享", "公開資訊", "關於我們"],
-    "en": ["Home", "Weather and Climate", "Warnings", "Air Quality", "Geophysics", "Corner of Science knowledge", "Sharing resources", "Open information", "About us"],
-    "pt": ["Página Principal", "Tempo e clima", "Avisos", "Qualidade do ar", "Geofísica", "Ciência e Tecnologia", "Recursos", "Informação pública", "Sobre nós"],
-}
-
-NEWS_CODES = [
-    "news", "normal", "important", "weather", "promote",
-    "Holiday_weather", "seasonal", "question",
-]
+NEWS_CODES = ["news", "normal", "important", "weather", "promote", "Holiday_weather", "seasonal", "question"]
 SITECONTENT_CODES = ["chat-info"]
-
 NAV_TIMEOUT = 60_000
-RENDER_WAIT = 1_500
+RENDER_WAIT = 2_500
 PDF_SIZE_LIMIT = 5 * 1024 * 1024
 _COMPRESS_ATTEMPTS = [("ebook", 150), ("screen", 96), ("screen", 72)]
-
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.2)",
-    "Accept": "application/json",
-})
-
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SMG-Monthly-Scraper/2.2)", "Accept": "application/json"})
 scraper_running_status: bool = False
 scraper_execution_result: dict = {"success": False, "filename": "", "message": "Idle", "files": []}
 
@@ -164,19 +140,11 @@ def collect_month_articles(year: int, month: int) -> list[dict]:
         seen_keys: set[str] = set()
         for code in NEWS_CODES:
             rows = fetch_cms_json(f"{CMS_BASE}/{cms_lang}/api/news/{code}")
-            matched = _ingest_rows(
-                rows, fe_lang, cms_lang, year, month, code,
-                lambda fl, aid: f"{BASE_URL}/{fl}/news/{aid}",
-                groups, group_dates, seen_keys,
-            )
+            matched = _ingest_rows(rows, fe_lang, cms_lang, year, month, code, lambda fl, aid: f"{BASE_URL}/{fl}/news-detail/{aid}", groups, group_dates, seen_keys)
             log.info(f"  news/{code}: {matched} in {year}-{month:02d} (total {len(rows)})")
         for code in SITECONTENT_CODES:
             rows = fetch_cms_json(f"{CMS_BASE}/{cms_lang}/api/sitecontent/{code}")
-            matched = _ingest_rows(
-                rows, fe_lang, cms_lang, year, month, f"sitecontent:{code}",
-                lambda fl, aid, c=code: f"{BASE_URL}/{fl}/{c}",
-                groups, group_dates, seen_keys,
-            )
+            matched = _ingest_rows(rows, fe_lang, cms_lang, year, month, f"sitecontent:{code}", lambda fl, aid, c=code: f"{BASE_URL}/{fl}/{c}/{aid}", groups, group_dates, seen_keys)
             log.info(f"  sitecontent/{code}: {matched} in {year}-{month:02d} (total {len(rows)})")
     ordered_keys = sorted(groups.keys(), key=lambda k: (group_dates.get(k) or datetime.min, k))
     flat: list[dict] = []
@@ -188,162 +156,61 @@ def collect_month_articles(year: int, month: int) -> list[dict]:
     log.info(f"Total language variants to render: {len(flat)}")
     return flat
 
-def build_article_html(item: dict) -> str:
-    title = item["title"]
-    content = item.get("content") or ""
-    lang = item["lang"]
-    date_str = item["date_str"]
-    label = LANG_LABEL.get(lang, lang.upper())
-    source_url = item.get("url", "")
-    source_tag = item.get("source", "")
-    logo_src = SMG_LOGO.get(lang, SMG_LOGO["zh"])
-    nav_html = "".join(f"<li>{item_label}</li>" for item_label in SMG_NAV.get(lang, SMG_NAV["zh"]))
-    content = re.sub(r'(src|href)=(["\'])\/uploads\/', rf'\1=\2{CMS_BASE}/uploads/', content)
-    content = re.sub(r'(src|href)=(["\'])\/\/', r'\1=\2https://', content)
-    return f"""<!DOCTYPE html>
-<html lang="{lang}">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>
-  * {{ box-sizing: border-box; }}
-  html, body {{
-    margin: 0; padding: 0;
-    font-family: "Noto Sans TC", "Noto Sans SC", "Microsoft YaHei",
-                 "PingFang TC", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
-    font-size: 14px; line-height: 1.7; color: #222;
-    background: #fff;
-  }}
-  .site-header {{
-    width: 100%;
-    background:
-      linear-gradient(rgb(2, 186, 188), rgba(2, 186, 188, 0.4) 100%),
-      url("{SMG_HEADER_BG}") center / cover no-repeat;
-    min-height: 92px;
-    display: flex;
-    align-items: center;
-    padding: 10px 28px;
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }}
-  .site-header img.logo {{
-    height: 58px;
-    width: auto;
-    max-width: 360px;
-    display: block;
-  }}
-  .site-nav {{
-    width: 100%;
-    background: #129ea3;
-    color: #fff;
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }}
-  .site-nav ul {{
-    list-style: none;
-    margin: 0;
-    padding: 0 20px;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    min-height: 40px;
-  }}
-  .site-nav li {{
-    color: #fff;
-    font-size: 13px;
-    padding: 8px 12px;
-    white-space: nowrap;
-  }}
-  .article {{
-    max-width: 800px;
-    margin: 0 auto;
-    padding: 22px 32px 28px;
-  }}
-  .meta {{ font-size: 12px; color: #666; margin-bottom: 8px; border-bottom: 1px solid #ddd; padding-bottom: 8px; }}
-  .meta span {{ margin-right: 16px; }}
-  h1 {{ font-size: 20px; font-weight: 700; margin: 12px 0 20px; line-height: 1.4; color: #0e8c90; }}
-  .body img {{ max-width: 100%; height: auto; display: block; margin: 12px auto; }}
-  .body p {{ margin: 0 0 12px; }}
-  .body table {{ border-collapse: collapse; width: 100%; margin: 12px 0; }}
-  .body th, .body td {{ border: 1px solid #ccc; padding: 6px 8px; text-align: left; }}
-  .footer {{ margin-top: 28px; padding-top: 10px; border-top: 1px solid #eee; font-size: 11px; color: #999; }}
-  @media print {{
-    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
-  }}
-</style>
-</head>
-<body>
-  <header class="site-header">
-    <img class="logo" src="{logo_src}" alt="SMG">
-  </header>
-  <nav class="site-nav"><ul>{nav_html}</ul></nav>
-  <div class="article">
-    <div class="meta">
-      <span>📅 {date_str}</span>
-      <span>🌐 {label}</span>
-      <span>#{item['id']}</span>
-      <span>{source_tag}</span>
-    </div>
-    <h1>{title}</h1>
-    <div class="body">{content if content else "<p><em>（此語言版本暫無正文內容）</em></p>"}</div>
-    <div class="footer">Source: {source_url}</div>
-  </div>
-</body>
-</html>"""
+def _prepare_live_page_for_pdf(page: Page) -> None:
+    try:
+        page.emulate_media(media="screen")
+    except Exception:
+        pass
+    try:
+        page.add_style_tag(content="html, body { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; } .mega-menu, .dropdown-menu { display: none !important; } #menu-button { display: none !important; }")
+    except Exception:
+        pass
 
 def process_article(page: Page, item: dict, tmp_dir: Path, seq: int) -> Optional[Path]:
     safe = (item["title"] or "untitled")[:30].replace("/", "-")
     dest = tmp_dir / sanitize_filename(f"{seq:03d}_{item['date_str']}_{item['lang']}_{safe}.pdf")
+    url = (item.get("url") or "").strip()
     try:
-        html = build_article_html(item)
-        page.set_content(html, wait_until="networkidle", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(RENDER_WAIT)
+        if not url:
+            raise RuntimeError("missing article url")
+        log.info(f"  Open page: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        try:
+            page.wait_for_function("() => { const h = document.querySelector('h1'); return !!(h && h.textContent && h.textContent.trim().length > 1); }", timeout=20_000)
+        except Exception:
+            page.wait_for_timeout(2_000)
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
-        page.pdf(path=str(dest), format="A4", print_background=True,
-                 margin={"top": "0mm", "bottom": "10mm", "left": "0mm", "right": "0mm"})
+        page.wait_for_timeout(RENDER_WAIT)
+        _prepare_live_page_for_pdf(page)
+        page.pdf(path=str(dest), format="A4", print_background=True, margin={"top": "0mm", "bottom": "8mm", "left": "0mm", "right": "0mm"})
         if dest.exists() and dest.stat().st_size > 1_000:
             return dest
         log.warning(f"  PDF too small, skipping: {dest.name}")
         return None
     except Exception as e:
-        log.warning(f"  Failed processing id={item['id']} [{item['lang']}]: {e}")
+        log.warning(f"  Live page failed id={item['id']} [{item['lang']}]: {e}")
         return None
 
 def compress_pdf(input_path: Path, output_path: Path) -> bool:
     input_size = input_path.stat().st_size
     if input_size <= PDF_SIZE_LIMIT:
-        log.info(f"  PDF is {input_size / 1_048_576:.2f} MB — already under limit")
         shutil.copy2(input_path, output_path)
         return True
-    log.info(f"  PDF is {input_size / 1_048_576:.2f} MB — compressing…")
     for gs_setting, img_dpi in _COMPRESS_ATTEMPTS:
-        cmd = [
-            "gs", "-dBATCH", "-dNOPAUSE", "-dQUIET", "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.5", f"-dPDFSETTINGS=/{gs_setting}",
-            "-dDownsampleColorImages=true", "-dDownsampleGrayImages=true", "-dDownsampleMonoImages=true",
-            f"-dColorImageResolution={img_dpi}", f"-dGrayImageResolution={img_dpi}",
-            f"-dMonoImageResolution={min(img_dpi * 2, 300)}",
-            "-dCompressFonts=true", "-dEmbedAllFonts=true",
-            f"-sOutputFile={output_path}", str(input_path),
-        ]
+        cmd = ["gs", "-dBATCH", "-dNOPAUSE", "-dQUIET", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.5", f"-dPDFSETTINGS=/{gs_setting}", "-dDownsampleColorImages=true", "-dDownsampleGrayImages=true", "-dDownsampleMonoImages=true", f"-dColorImageResolution={img_dpi}", f"-dGrayImageResolution={img_dpi}", f"-dMonoImageResolution={min(img_dpi * 2, 300)}", "-dCompressFonts=true", "-dEmbedAllFonts=true", f"-sOutputFile={output_path}", str(input_path)]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode != 0:
-                log.warning(f"  gs /{gs_setting} failed: {result.stderr[:200]}")
                 continue
         except FileNotFoundError:
-            log.warning("  Ghostscript not found — skipping compression")
             shutil.copy2(input_path, output_path)
             return False
         except subprocess.TimeoutExpired:
-            log.warning(f"  gs /{gs_setting} timed out")
             continue
         out_size = output_path.stat().st_size if output_path.exists() else 0
-        log.info(f"  /{gs_setting} @{img_dpi}dpi → {out_size / 1_048_576:.2f} MB"
-                 + (" OK" if out_size <= PDF_SIZE_LIMIT else " (still large)"))
         if out_size <= PDF_SIZE_LIMIT:
             return True
     if output_path.exists() and output_path.stat().st_size > 0:
@@ -357,28 +224,20 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
         if not year or not month:
             year, month = get_target_month()
         log.info(f"SMG Monthly Scraper — Target: {year}-{month:02d}")
-        log.info("   Output: ONE PDF | official header | date ASC, then zh → pt → en")
-        log.info("   Sources: news/* + sitecontent/chat-info")
         current_dir = Path(os.getcwd())
         tmp_dir = current_dir / f"smg_tmp_{year}_{month:02d}"
         tmp_dir.mkdir(exist_ok=True)
         items = collect_month_articles(year, month)
         if not items:
-            log.warning(f"No articles found for {year}-{month:02d}.")
             scraper_execution_result = {"success": False, "filename": "", "files": [], "message": "No matching articles found."}
             return
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": 1200, "height": 1600}, accept_downloads=True)
+            ctx = browser.new_context(viewport={"width": 1400, "height": 900}, accept_downloads=True)
             page = ctx.new_page()
             writer = PdfWriter()
             for i, item in enumerate(items, 1):
-                content_len = len(item.get("content") or "")
-                log.info(
-                    f"\n({i}/{len(items)}) [{item['date_str']}] "
-                    f"[{item['lang'].upper()}] {item['title'][:50]} "
-                    f"(body {content_len} chars) [{item.get('source','')}]"
-                )
+                log.info(f"\n({i}/{len(items)}) [{item['date_str']}] [{item['lang'].upper()}] {item['title'][:50]}")
                 pdf_path = process_article(page, item, tmp_dir, i)
                 if pdf_path:
                     try:
@@ -386,7 +245,6 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                     except Exception as e:
                         log.warning(f"  Could not append {pdf_path.name}: {e}")
             if len(writer.pages) == 0:
-                log.warning("No pages rendered.")
                 scraper_execution_result = {"success": False, "filename": "", "files": [], "message": "No pages rendered."}
                 browser.close()
                 return
@@ -395,106 +253,23 @@ def execute_scraping_worker(year: Optional[int], month: Optional[int]):
                 writer.write(fh)
             final_filename = f"SMG_Monthly_Report_{year}_{month:02d}.pdf"
             output = current_dir / final_filename
-            log.info(f"Compressing → {output.name} (target ≤ 5 MB)…")
             compress_pdf(raw_output, output)
             log.info(f"\nDone: {output.name}  ({output.stat().st_size / 1_048_576:.2f} MB)")
             raw_output.unlink(missing_ok=True)
             browser.close()
-        scraper_execution_result = {
-            "success": True,
-            "filename": final_filename,
-            "files": [final_filename],
-            "message": f"Report generated: {final_filename}",
-        }
+        scraper_execution_result = {"success": True, "filename": final_filename, "files": [final_filename], "message": f"Report generated: {final_filename}"}
     except Exception as e:
         log.error(f"Execution error: {e}")
         scraper_execution_result = {"success": False, "filename": "", "files": [], "message": str(e)}
     finally:
         scraper_running_status = False
 
-CONTROL_PANEL_UI_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="zh">
-<head>
-    <meta charset="UTF-8"><title>SMG Report Engine Portal</title>
-    <style>
-        body { font-family: sans-serif; background: #eef2f3; padding: 30px; }
-        .container { max-width: 900px; margin: auto; background: #fff; padding: 25px; border-radius: 10px; }
-        input, select, button { padding: 10px; margin-bottom: 15px; width: 100%; box-sizing: border-box; }
-        button { background: #3498db; color: #fff; border: none; cursor: pointer; font-weight: bold; }
-        .console-box { background: #1e272e; color: #ced6e0; padding: 15px; height: 350px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; }
-        .status-banner { padding: 12px; background: #f1f2f6; font-weight: bold; margin-bottom: 20px; }
-        .download-links a { display: inline-block; margin: 5px 8px 5px 0; background:#2ed573; color:#fff; padding:10px 14px; text-decoration:none; border-radius:4px; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h2>SMG Monthly PDF Scraper Console</h2>
-    <p style="color:#666;font-size:0.9em;">單一 PDF｜官網頁首｜按日期排序｜中文→葡文→英文｜含新聞 + 天氣Fun識(chat-info)</p>
-    <label>Target Year:</label> <input type="number" id="inputYear" placeholder="Leave blank for default (last month)">
-    <label>Target Month:</label>
-    <select id="inputMonth">
-        <option value="">-- Default Last Month --</option>
-        <option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option>
-        <option value="5">05</option><option value="6">06</option><option value="7">07</option><option value="8">08</option>
-        <option value="9">09</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
-    </select>
-    <button id="btnAction" onclick="triggerTask()">Launch Scraper Engine</button>
-    <div id="statusBanner" class="status-banner">System Engine Status: Idle</div>
-    <div id="downloadSection" style="display: none; padding:15px; background:#e8f4fd; margin-bottom:15px;">
-        <div class="download-links" id="downloadLinks"></div>
-    </div>
-    <div id="consoleLog" class="console-box">Waiting for process invocation...</div>
-</div>
-<script>
-    let offset = 0, interval = null;
-    function checkStatus() {
-        fetch('/engine-status').then(r=>r.json()).then(d=>{
-            document.getElementById('statusBanner').innerText = d.running ? "Status: Running..." : "Status: " + d.result.message;
-            document.getElementById('btnAction').disabled = d.running;
-            if(!d.running && d.result.files && d.result.files.length) {
-                document.getElementById('downloadSection').style.display = 'block';
-                const box = document.getElementById('downloadLinks');
-                box.innerHTML = '';
-                d.result.files.forEach(f => {
-                    const a = document.createElement('a');
-                    a.href = "/retrieve-file?file=" + encodeURIComponent(f);
-                    a.textContent = "Download " + f;
-                    box.appendChild(a);
-                });
-                clearInterval(interval);
-            }
-        });
-    }
-    function fetchLogs() {
-        fetch('/poll-logs?offset='+offset).then(r=>r.json()).then(d=>{
-            if(d.logs.length) {
-                const c = document.getElementById('consoleLog');
-                d.logs.forEach(m => c.innerText += m + "\\n");
-                offset += d.logs.length;
-                c.scrollTop = c.scrollHeight;
-            }
-        });
-    }
-    function triggerTask() {
-        offset = 0; document.getElementById('consoleLog').innerText = "";
-        document.getElementById('downloadSection').style.display = 'none';
-        fetch('/trigger-execution', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({year: document.getElementById('inputYear').value, month: document.getElementById('inputMonth').value})
-        }).then(()=>{ clearInterval(interval); interval = setInterval(()=>{checkStatus(); fetchLogs();}, 1500); });
-    }
-    checkStatus();
-</script>
-</body>
-</html>
-"""
+CONTROL_PANEL_UI_TEMPLATE = """<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"UTF-8\"><title>SMG Report Engine Portal</title></head><body><h2>SMG Monthly PDF Scraper Console</h2><p>單一 PDF｜原網頁畫面</p><input type=\"number\" id=\"inputYear\" placeholder=\"Year\"><select id=\"inputMonth\"><option value=\"\">Default</option><option value=\"1\">01</option><option value=\"2\">02</option><option value=\"3\">03</option><option value=\"4\">04</option><option value=\"5\">05</option><option value=\"6\">06</option><option value=\"7\">07</option><option value=\"8\">08</option><option value=\"9\">09</option><option value=\"10\">10</option><option value=\"11\">11</option><option value=\"12\">12</option></select><button onclick=\"triggerTask()\">Launch</button><div id=\"statusBanner\"></div><div id=\"downloadLinks\"></div><pre id=\"consoleLog\"></pre><script>let offset=0,interval=null;function checkStatus(){fetch('/engine-status').then(r=>r.json()).then(d=>{document.getElementById('statusBanner').innerText=d.running?'Running':d.result.message;if(!d.running&&d.result.files&&d.result.files.length){const box=document.getElementById('downloadLinks');box.innerHTML='';d.result.files.forEach(f=>{const a=document.createElement('a');a.href='/retrieve-file?file='+encodeURIComponent(f);a.textContent='Download '+f;box.appendChild(a);});clearInterval(interval);}});}function fetchLogs(){fetch('/poll-logs?offset='+offset).then(r=>r.json()).then(d=>{if(d.logs.length){const c=document.getElementById('consoleLog');d.logs.forEach(m=>c.innerText+=m+'\\n');offset+=d.logs.length;}});}function triggerTask(){offset=0;document.getElementById('consoleLog').innerText='';fetch('/trigger-execution',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({year:document.getElementById('inputYear').value,month:document.getElementById('inputMonth').value})}).then(()=>{clearInterval(interval);interval=setInterval(()=>{checkStatus();fetchLogs();},1500);});}checkStatus();</script></body></html>"""
 
 app = Flask(__name__)
 @app.route('/')
 def serve_index_portal():
     return render_template_string(CONTROL_PANEL_UI_TEMPLATE)
-
 @app.route('/trigger-execution', methods=['POST'])
 def trigger_execution_endpoint():
     global scraper_running_status, scraper_execution_result, app_log_buffer
@@ -504,29 +279,17 @@ def trigger_execution_endpoint():
     app_log_buffer.clear()
     scraper_execution_result = {"success": False, "filename": "", "files": [], "message": "Started"}
     scraper_running_status = True
-    threading.Thread(
-        target=execute_scraping_worker,
-        args=(
-            int(p.get('year')) if p.get('year') else None,
-            int(p.get('month')) if p.get('month') else None,
-        ),
-    ).start()
+    threading.Thread(target=execute_scraping_worker, args=(int(p.get('year')) if p.get('year') else None, int(p.get('month')) if p.get('month') else None)).start()
     return jsonify({"status": "initiated"})
-
 @app.route('/engine-status')
 def get_engine_status_endpoint():
     return jsonify({"running": scraper_running_status, "result": scraper_execution_result})
-
 @app.route('/poll-logs')
 def poll_logs_endpoint():
     return jsonify({"logs": app_log_buffer[request.args.get('offset', 0, type=int):]})
-
 @app.route('/retrieve-file')
 def retrieve_file_endpoint():
-    file_path = Path(os.getcwd()) / request.args.get('file', '')
-    return send_file(file_path, as_attachment=True)
-
-if __name__ == "__main__":
-    print("Starting server and opening browser...")
-    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    return send_file(Path(os.getcwd()) / request.args.get('file', ''), as_attachment=True)
+if __name__ == '__main__':
+    threading.Timer(1.5, lambda: webbrowser.open('http://127.0.0.1:5000')).start()
+    app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
