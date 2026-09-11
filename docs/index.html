@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>氣象局月報 PDF</title>
+  <style>
+    :root { color-scheme: light; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font-family: "Segoe UI", "Noto Sans TC", sans-serif;
+      background: #f3f6f8; color: #16323d;
+    }
+    .card {
+      width: min(440px, calc(100vw - 32px));
+      background: #fff; border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(15, 40, 50, .12);
+      padding: 28px 24px 24px;
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    p.sub { margin: 0 0 18px; color: #5b7380; font-size: 14px; line-height: 1.5; }
+    label { display: block; font-size: 13px; margin: 10px 0 6px; color: #3d5560; }
+    input {
+      width: 100%; box-sizing: border-box; padding: 10px 12px;
+      border: 1px solid #c9d6dc; border-radius: 8px; font-size: 15px;
+    }
+    button {
+      width: 100%; margin-top: 18px; border: 0; border-radius: 10px;
+      padding: 13px 16px; font-size: 16px; font-weight: 700;
+      background: #0e7c86; color: #fff; cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .msg { margin-top: 14px; font-size: 14px; line-height: 1.5; min-height: 1.5em; }
+    .ok { color: #0b6b3a; }
+    .err { color: #b42318; }
+    a { color: #0e7c86; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>氣象局月報 PDF</h1>
+    <p class="sub">唔使登入 GitHub。填年月或留空（默認上個月），然後點一下個按鈕。</p>
+    <label for="year">年份（可留空）</label>
+    <input id="year" inputmode="numeric" placeholder="例如 2026" />
+    <label for="month">月份（可留空）</label>
+    <input id="month" inputmode="numeric" placeholder="例如 8" />
+    <button id="runBtn" type="button">幫我出 PDF</button>
+    <div id="msg" class="msg"></div>
+  </div>
+  <script>
+    const OWNER = "jeffreykan97work-cmd";
+    const REPO = "-PDF";
+    const WORKFLOW = "pdf.yml";
+    const ACTIONS = "https://github.com/" + OWNER + "/" + REPO + "/actions/workflows/" + WORKFLOW;
+
+    function tokenFromLink() {
+      const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+      const query = new URLSearchParams(location.search);
+      return (hash.get("t") || query.get("t") || "").trim();
+    }
+
+    function setMsg(text, cls) {
+      const el = document.getElementById("msg");
+      el.className = "msg " + (cls || "");
+      el.innerHTML = text;
+    }
+
+    document.getElementById("runBtn").addEventListener("click", async () => {
+      const token = tokenFromLink();
+      if (!token) {
+        setMsg("這條連結未帶好跑程密鑰。請用倉庫人傳出來嘅完整連結。", "err");
+        return;
+      }
+      const year = document.getElementById("year").value.trim();
+      const month = document.getElementById("month").value.trim();
+      const btn = document.getElementById("runBtn");
+      btn.disabled = true;
+      setMsg("冇緊去跑緊…", "");
+      try {
+        const res = await fetch(
+          "https://api.github.com/repos/" + OWNER + "/" + REPO + "/actions/workflows/" + WORKFLOW + "/dispatches",
+          {
+            method: "POST",
+            headers: {
+              "Accept": "application/vnd.github+json",
+              "Authorization": "Bearer " + token,
+              "X-GitHub-Api-Version": "2022-11-28",
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ ref: "main", inputs: { year: year, month: month } })
+          }
+        );
+        if (res.status === 204 || res.ok) {
+          setMsg('已幫你跑起。約 5–20 分鐘後去 <a href="' + ACTIONS + '" target="_blank" rel="noopener">這頁</a> 下載 <b>SMG-Monthly-Report</b>。', "ok");
+        } else {
+          const text = await res.text();
+          setMsg("跑唔到（" + res.status + "）。" + text.slice(0, 180), "err");
+        }
+      } catch (err) {
+        setMsg("網路錯誤：" + err, "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
