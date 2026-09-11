@@ -1,7 +1,5 @@
 # SMG Monthly PDF
 
-有連結的同事可以跑 Workflow 出 PDF，但唔可以改程式。`main` 分支已鎖死。
-
 ## 跑 PDF 嘅連結
 
 https://github.com/jeffreykan97work-cmd/-PDF/actions/workflows/pdf.yml
