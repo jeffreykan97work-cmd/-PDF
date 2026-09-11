@@ -14,6 +14,14 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: smg-monthly-pdf
+  cancel-in-progress: false
+
 jobs:
   generate-report:
     runs-on: ubuntu-latest
