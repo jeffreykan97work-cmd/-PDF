@@ -42,23 +42,33 @@ jobs:
           sudo apt-get install -y -q ghostscript
 
       - name: Install Python dependencies
-        run: pip install playwright==1.51.0 pypdf==4.3.1 requests==2.32.3
+        run: pip install playwright==1.51.0 pypdf==4.3.1 requests==2.32.3 flask
 
       - name: Install Playwright Chromium browser
         run: playwright install chromium --with-deps
 
       - name: "Run scraper (single PDF: zh→pt→en by date)"
+        env:
+          IN_YEAR: ${{ github.event.inputs.year }}
+          IN_MONTH: ${{ github.event.inputs.month }}
         run: |
-          ARGS=""
-          [[ -n "${{ github.event.inputs.year }}"  ]] && ARGS="$ARGS --year ${{ github.event.inputs.year }}"
-          [[ -n "${{ github.event.inputs.month }}" ]] && ARGS="$ARGS --month ${{ github.event.inputs.month }}"
-          python scraper.py $ARGS
+          python app.py --cli ${IN_YEAR:+--year "$IN_YEAR"} ${IN_MONTH:+--month "$IN_MONTH"}
+
+      - name: Show completeness report
+        if: always()
+        run: |
+          for f in SMG_Completeness_Report_*.txt; do
+            [ -f "$f" ] || continue
+            { echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Upload monthly report PDF
         uses: actions/upload-artifact@v4
         with:
           name: SMG-Monthly-Report
-          path: SMG_Monthly_Report_*.pdf
+          path: |
+            SMG_Monthly_Report_*.pdf
+            SMG_Completeness_Report_*.txt
           retention-days: 90
           if-no-files-found: error
 

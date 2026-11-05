@@ -543,6 +543,31 @@ def poll_logs_endpoint():
 @app.route('/retrieve-file')
 def retrieve_file_endpoint():
     return send_file(Path(os.getcwd()) / request.args.get('file', ''), as_attachment=True)
+def run_cli(argv: Optional[list[str]] = None) -> int:
+    """
+    命令列模式（給 GitHub Actions 使用）：python app.py --cli [--year Y] [--month M]
+    年月皆留空 = 上個月。成功回傳 0，失敗回傳 1。
+    """
+    import argparse
+    ap = argparse.ArgumentParser(description="SMG monthly PDF scraper (headless)")
+    ap.add_argument("--cli", action="store_true", help="不啟動網頁介面，直接執行並結束")
+    ap.add_argument("--year", type=int, default=None)
+    ap.add_argument("--month", type=int, default=None)
+    args = ap.parse_args(argv)
+    if args.year and not args.month:
+        ap.error("指定 --year 時也必須指定 --month")
+    if args.month and not args.year:
+        args.year = date.today().year
+    if args.month is not None and not 1 <= args.month <= 12:
+        ap.error("--month 必須介於 1 到 12")
+    execute_scraping_worker(args.year, args.month)
+    result = scraper_execution_result
+    print(result.get("message", ""))
+    return 0 if result.get("success") else 1
+
+
 if __name__ == '__main__':
+    if "--cli" in sys.argv[1:]:
+        sys.exit(run_cli())
     threading.Timer(1.5, lambda: webbrowser.open('http://127.0.0.1:5000')).start()
     app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
